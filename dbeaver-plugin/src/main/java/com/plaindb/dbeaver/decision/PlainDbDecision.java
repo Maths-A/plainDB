@@ -1,4 +1,4 @@
-package com.plaindb.dbeaver.model;
+package com.plaindb.dbeaver.decision;
 
 public final class PlainDbDecision {
     private final boolean approved;

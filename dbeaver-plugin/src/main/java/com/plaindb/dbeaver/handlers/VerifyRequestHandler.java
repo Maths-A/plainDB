@@ -1,10 +1,10 @@
 package com.plaindb.dbeaver.handlers;
 
-import com.plaindb.dbeaver.model.PlainDbDecision;
 import com.plaindb.dbeaver.policy.EnglishOnlyGuard;
 import com.plaindb.dbeaver.service.PlainDbServiceClient;
 import com.plaindb.dbeaver.ui.PlainDbRequestDialog;
 import com.plaindb.dbeaver.request.PlainDbRequest;
+import com.plaindb.dbeaver.decision.PlainDbDecision;
 import org.eclipse.core.commands.AbstractHandler;
 import org.eclipse.core.commands.ExecutionEvent;
 import org.eclipse.core.commands.ExecutionException;

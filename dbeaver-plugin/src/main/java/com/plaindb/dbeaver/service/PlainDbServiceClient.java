@@ -1,6 +1,6 @@
 package com.plaindb.dbeaver.service;
 
-import com.plaindb.dbeaver.model.PlainDbDecision;
+import com.plaindb.dbeaver.decision.PlainDbDecision;
 import com.plaindb.dbeaver.request.PlainDbRequest;
 
 public final class PlainDbServiceClient {

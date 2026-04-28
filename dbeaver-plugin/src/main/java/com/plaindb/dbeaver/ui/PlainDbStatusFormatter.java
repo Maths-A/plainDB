@@ -1,6 +1,6 @@
 package com.plaindb.dbeaver.ui;
 
-import com.plaindb.dbeaver.model.PlainDbDecision;
+import com.plaindb.dbeaver.decision.PlainDbDecision;
 
 public final class PlainDbStatusFormatter {
     public String format(PlainDbDecision decision) {
