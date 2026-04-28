@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+  <extension point="org.eclipse.ui.commands">
+    <command
+      id="com.plaindb.dbeaver.commands.verifySql"
+      name="Verify database request with PlainDB" />
+  </extension>
+
+  <extension point="org.eclipse.ui.handlers">
+    <handler
+      class="com.plaindb.dbeaver.handlers.VerifyRequestHandler"
+      commandId="com.plaindb.dbeaver.commands.verifySql" />
+  </extension>
+</plugin>
