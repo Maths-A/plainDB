@@ -1,4 +1,14 @@
 __pycache__/
-*.pyc
+*.py[cod]
+
 .venv/
-examples/demo.sqlite3
+venv/
+
+dbeaver-plugin/target/
+
+*.db
+*.sqlite
+*.sqlite3
+*.tmp
+
+.DS_Store

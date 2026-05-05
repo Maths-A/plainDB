@@ -3,8 +3,12 @@ Bundle-ManifestVersion: 2
 Bundle-Name: PlainDB DBeaver Plugin
 Bundle-SymbolicName: com.plaindb.dbeaver;singleton:=true
 Bundle-Version: 0.1.0.qualifier
-Bundle-RequiredExecutionEnvironment: JavaSE-17
+Bundle-RequiredExecutionEnvironment: JavaSE-21
 Require-Bundle: org.eclipse.core.runtime,
  org.eclipse.ui,
- org.eclipse.jface
+ org.eclipse.jface,
+ org.eclipse.swt,
+ org.jkiss.dbeaver.core,
+ org.jkiss.dbeaver.model;visibility:=reexport,
+ org.jkiss.dbeaver.registry
 Export-Package: com.plaindb.dbeaver

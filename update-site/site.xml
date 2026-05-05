@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <description name="PlainDB Update Site" url="file:///Users/maubert/Documents/UCSC/Research/plainDB/update-site">
+      Local update site for PlainDB DBeaver plugin development
+   </description>
+   <feature url="features/com.plaindb.dbeaver.feature_1.0.0.jar" id="com.plaindb.dbeaver.feature" version="1.0.0">
+      <category name="plaindb"/>
+   </feature>
+   <category-def name="plaindb" label="PlainDB">
+      <description>PlainDB tools and integrations</description>
+   </category-def>
+</site>

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feature
+      id="com.plaindb.dbeaver.feature"
+      label="PlainDB DBeaver Plugin"
+      version="1.0.0"
+      provider-name="PlainDB">
+
+   <description url="https://github.com/plaindb">
+      DBeaver plugin for PlainDB SQL verification and request handling.
+   </description>
+
+   <license url="">
+      MIT License
+   </license>
+
+   <plugin
+         id="com.plaindb.dbeaver"
+         download-size="0"
+         install-size="0"
+         version="0.1.0.qualifier"
+         unpack="false"/>
+
+</feature>

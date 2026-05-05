@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+   <feature id="com.plaindb.dbeaver.feature" version="1.0.0">
+      <category name="plaindb"/>
+   </feature>
+   <category-def name="plaindb" label="PlainDB">
+      <description>PlainDB tools and integrations</description>
+   </category-def>
+</site>

@@ -13,7 +13,7 @@ public final class EnglishOnlyGuard {
             return false;
         }
 
-        return containsEnglishSignal(normalized);
+        return containsLatinLetters(normalized);
     }
 
     private boolean containsNonAscii(String text) {
@@ -25,17 +25,17 @@ public final class EnglishOnlyGuard {
         return false;
     }
 
-    private boolean containsEnglishSignal(String text) {
-        return text.contains(" please ")
-            || text.startsWith("please ")
-            || text.contains(" update ")
-            || text.contains(" insert ")
-            || text.contains(" delete ")
-            || text.contains(" show ")
-            || text.contains(" list ")
-            || text.contains(" change ")
-            || text.contains(" create ")
-            || text.contains(" find ")
-            || text.contains(" user ");
+    private boolean containsLatinLetters(String text) {
+        int letterCount = 0;
+        for (int index = 0; index < text.length(); index++) {
+            char ch = text.charAt(index);
+            if (ch >= 'a' && ch <= 'z') {
+                letterCount++;
+                if (letterCount >= 2) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }

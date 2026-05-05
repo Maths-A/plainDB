@@ -4,7 +4,25 @@
   <extension point="org.eclipse.ui.commands">
     <command
       id="com.plaindb.dbeaver.commands.verifySql"
-      name="Verify database request with PlainDB" />
+      name="AI-driven database manipulation with PlainDB" />
+  </extension>
+
+  <extension point="org.eclipse.ui.menus">
+    <menuContribution locationURI="menu:org.eclipse.ui.main.menu?after=additions">
+      <menu id="com.plaindb.dbeaver.menu" label="PlainDB">
+        <command
+          commandId="com.plaindb.dbeaver.commands.verifySql"
+          label="AI-driven database manipulation"
+          style="push" />
+      </menu>
+    </menuContribution>
+
+    <menuContribution locationURI="menu:org.jkiss.dbeaver.menu.sql.open">
+      <command
+        commandId="com.plaindb.dbeaver.commands.verifySql"
+        label="AI-driven database manipulation"
+        style="push" />
+    </menuContribution>
   </extension>
 
   <extension point="org.eclipse.ui.handlers">
