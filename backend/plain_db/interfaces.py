@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from typing import Any, Dict, List, Optional
 
+from .schema import DatabaseSchema
 from .models import ExecutionResult, SQLCandidate, UserIntent, VerificationStageResult
 
 
@@ -32,6 +33,10 @@ class DatabaseAdapter(ABC):
 
     @abstractmethod
     def snapshot(self, tx: TransactionHandle, watched_tables: List[str]) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def describe_schema(self) -> DatabaseSchema:
         raise NotImplementedError
 
 

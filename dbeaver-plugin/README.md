@@ -6,23 +6,18 @@ This is the DBeaver integration layer for **PlainDB** – a database-agnostic sa
 
 ### Main Capabilities
 - **Verify SQL Intent** - Convert natural English requests into SQL queries
-- **Multiple Providers**:
-  - **Local PlainDB** - Verification pipeline only (no AI)
-  - **OpenAI** - GPT-3.5, GPT-4 via OpenAI API
-  - **Gemini** - Google Gemini 2.5 Flash via Generative Language API
-  - **Remote Backend** - Connect to PlainDB backend service
+- **Backend-only architecture** - Calls PlainDB backend `/run` for verification, execution, and commit control
 - **Database Support** - PostgreSQL, MySQL, SQLite, Oracle, SQL Server, etc.
-- **Verification Stages** - See semantic, safety, effect, and post-commit verification results
-- **Transaction Safety** - Automatic rollback on verification failures
+- **Rollback Integration** - Uses backend rollback IDs (`/rollback/{rollback_id}`)
 - **English Validation** - Ensures requests are in English only
 
 ### Architecture
 
 The plugin is a **thin client** that:
 1. Takes natural language SQL requests from users
-2. Calls **AI providers** (OpenAI, Gemini) or a **PlainDB backend service** to generate SQL
-3. Displays verification results and execution audit trail
-4. Allows safe SQL execution through the verification pipeline
+2. Calls the PlainDB backend `/run`
+3. Displays generated SQL and result status in DBeaver
+4. Supports backend rollback actions when rollback IDs are returned
 
 ```
 DBeaver Plugin
@@ -31,7 +26,7 @@ Verify Request Dialog
     ↓
 SqlGeneratorClient (Java)
     ↓ (HTTP)
-Backend API or AI Provider
+Backend `/run`
     ↓
 PlainDB Pipeline
     ↓
@@ -52,9 +47,8 @@ Once installed and DBeaver is restarted:
    - Or search for "PlainDB" in command palette (Ctrl/Cmd+Shift+P)
 3. **Configure Account (one-time):**
    - Click **Account** tab
-   - **Provider**: Select "PlainDB (Backend)", "OpenAI", or "Gemini (Google)"
-   - **API Key** (if using AI): Paste your OpenAI or Gemini API key
-   - **Backend URL** (if using backend): `http://localhost:8000` or remote URL
+   - **API Key**: Paste your Gemini API key (passed through to backend)
+   - **Backend URL**: `http://localhost:8000` or remote URL
    - Click **Save**
 
 ### Verification Dialog
@@ -66,7 +60,7 @@ Once configured, the **Verify Request** dialog shows:
 - **Request**: Write your SQL operation in English (e.g., "Show users older than 25")
 
 **Output Section:**
-- **Generated SQL**: The SQL candidate created by pipeline or AI
+- **Generated SQL**: The SQL candidate returned by backend pipeline
 - **Verification Results**: Pass/fail stages (semantic, safety, effect, post-commit)
 - **Execution Status**: Success/error with row count
 
@@ -78,7 +72,7 @@ Once configured, the **Verify Request** dialog shows:
 
 ### Example Workflows
 
-#### 1. Using PlainDB Backend (No AI)
+#### 1. Using PlainDB Backend
 
 ```
 1. Account Tab:
@@ -92,45 +86,7 @@ Once configured, the **Verify Request** dialog shows:
    - Click "Generate SQL"
 
 3. Results:
-   Output: SELECT * FROM users WHERE status='active' AND created_year=2024;
-   Stages: semantic ✓, safety ✓, execution ✓, post-commit ✓
-```
-
-#### 2. Using OpenAI (GPT-4)
-
-```
-1. Account Tab:
-   - Provider: "OpenAI (GPT-4)"
-   - API Key: "sk-..."
-   - Save
-
-2. Verify Request Tab:
-   - Database: "MySQL"
-   - Request: "Count orders placed last month"
-   - Click "Generate SQL"
-
-3. Results:
-   Output: SELECT COUNT(*) FROM orders WHERE MONTH(created_at)=MONTH(NOW())-1;
-   Stages: semantic ✓, safety ✓, execution ✓, post-commit ✓
-```
-
-#### 3. Using Gemini (Google)
-
-```
-1. Account Tab:
-   - Provider: "Gemini (Google)"
-   - API Key: "AIza..." (from Google Cloud)
-   - Custom Endpoint: (optional, leave blank for default)
-   - Save
-
-2. Verify Request Tab:
-   - Database: "SQLite"
-   - Request: "Get products with low stock"
-   - Click "Generate SQL"
-
-3. Results:
-   Output: SELECT * FROM products WHERE stock_count < minimum_threshold;
-   Stages: semantic ✓, safety ✓, execution ✓, post-commit ✓
+   Output includes generated SQL, commit status, and optional rollback ID for mutating SQL.
 ```
 
 ### Configuration
@@ -139,10 +95,9 @@ Once configured, the **Verify Request** dialog shows:
 
 | Field | Usage | Notes |
 |-------|-------|-------|
-| **Provider** | Select API source | "PlainDB (Backend)", "OpenAI", "Gemini" |
-| **API Key** | Authentication | Required for OpenAI/Gemini. Blank for backend. |
-| **Custom Endpoint** | Alternative server | For Gemini Vertex AI or self-hosted backend |
-| **Dry Run** | Test without commit | Rollback changes after verification |
+| **Backend URL** | Backend endpoint for all requests | Required; plugin calls backend `/run` and rollback endpoints |
+| **LLM Model** | Model passed to backend | Default: `gemini-2.5-flash` |
+| **API Key** | Authentication for provider used by backend | Required for backend requests that invoke Gemini |
 
 #### Backend Configuration
 
@@ -257,20 +212,15 @@ The current implementation follows this flow:
 │ - Creates SqlGeneratorClient        │
 └────────┬────────────────────────────┘
          │
-    [Route based on API key:]
-         │
-    ┌────┴────┐
-    │          │
-    ▼          ▼
-┌──────────┐  ┌──────────────┐
-│ OpenAI   │  │ Local        │
-│ API      │  │ PlainDB      │
-│ (Cloud)  │  │ Service      │
-└──────────┘  └──────────────┘
-    │          │
-    └────┬─────┘
-         │
-         ▼
+       [Backend call]
+          │
+          ▼
+   ┌─────────────────────┐
+   │ PlainDB Backend     │
+   │ /run + rollback API │
+   └────────┬────────────┘
+          │
+          ▼
 ┌─────────────────────┐
 │ Generated SQL       │
 │ (Displayed in       │
@@ -294,15 +244,14 @@ The current implementation follows this flow:
    - Action buttons
 
 2. **Service Layer**: `SqlGeneratorClient.java` - HTTP client supporting:
-   - OpenAI Chat Completions API (`gpt-3.5-turbo`)
-   - Local PlainDB service (`/api/v1/generate-sql`)
-   - JSON encoding/decoding
-   - Error handling
+   - PlainDB backend `/run` request contract
+   - PlainDB rollback API (`POST /rollback/{rollback_id}`)
+   - JSON encoding/decoding and error handling
 
 3. **Handler Layer**: `VerifyRequestHandler.java` - Orchestrates:
    - Dialog opening
    - Request validation (English-only)
-   - API selection logic
+   - Backend call wiring
    - Error messaging
 
 ## Local development

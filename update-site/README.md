@@ -19,7 +19,19 @@ bash scripts/build-update-site.sh
 This script:
 1. Copies the compiled plugin JAR (from DBeaver installation)
 2. Creates the feature JAR with metadata
-3. Generates site descriptors
+3. Signs plugin and feature JARs with a local certificate (default)
+4. Generates site descriptors
+
+By default, signing uses a local keystore generated at:
+- `update-site/.signing/plaindb-local-dev.p12`
+
+Environment variables to customize signing:
+- `PLAINDB_SIGN_UPDATE_SITE=0` to disable signing
+- `PLAINDB_SIGN_ALIAS`
+- `PLAINDB_SIGN_DNAME`
+- `PLAINDB_SIGN_STOREPASS`
+- `PLAINDB_SIGN_KEYPASS`
+- `PLAINDB_SIGN_KEYSTORE`
 
 ## Installing via DBeaver's Software Installer
 

@@ -1,26 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<?artifactRepository version="2.0"?>
-<artifacts repositoryType="org.eclipse.equinox.p2.artifact.repository.simpleRepository" version="2">
-  <properties size="1">
+<?artifactRepository version="1.0.0"?>
+<repository name="PlainDB Local Update Site" type="org.eclipse.equinox.internal.p2.artifact.repository.simpleRepository" version="1.0.0">
+  <properties size="2">
+    <property name="p2.compressed" value="false"/>
     <property name="p2.timestamp" value="1619203200000"/>
   </properties>
+  <mappings size="2">
+    <rule filter="(&amp; (classifier=osgi.bundle))" output='${repoUrl}/plugins/${id}_${version}.jar'/>
+    <rule filter="(&amp; (classifier=org.eclipse.update.feature))" output='${repoUrl}/features/${id}_${version}.jar'/>
+  </mappings>
   <artifacts size="2">
     <!-- Feature Artifact -->
     <artifact classifier="org.eclipse.update.feature" id="com.plaindb.dbeaver.feature" version="1.0.0">
       <properties size="2">
-        <property name="artifact.size" value="866"/>
-        <property name="download.size" value="866"/>
+        <property name="artifact.size" value="2878"/>
+        <property name="download.size" value="2878"/>
       </properties>
-      <repositoryURI uri="features/com.plaindb.dbeaver.feature_1.0.0.jar"/>
     </artifact>
     
     <!-- Plugin Artifact -->
     <artifact classifier="osgi.bundle" id="com.plaindb.dbeaver" version="0.1.0.qualifier">
       <properties size="2">
-        <property name="artifact.size" value="21938"/>
-        <property name="download.size" value="21938"/>
+        <property name="artifact.size" value="50711"/>
+        <property name="download.size" value="50711"/>
       </properties>
-      <repositoryURI uri="plugins/com.plaindb.dbeaver_0.1.0.qualifier.jar"/>
     </artifact>
   </artifacts>
-</artifacts>
+</repository>

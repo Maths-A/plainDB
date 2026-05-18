@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<?metadataRepository version="2.0.0"?>
-<repository name="PlainDB Local Update Site" type="metadata" version="2.0.0"
+<?metadataRepository version="1.0.0"?>
+<repository name="PlainDB Local Update Site" type="org.eclipse.equinox.internal.p2.metadata.repository.LocalMetadataRepository" version="1.0.0"
     xmlns="http://www.eclipse.org/equinox/p2/metadata/repository/2.0"
     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="http://www.eclipse.org/equinox/p2/metadata/repository/2.0 http://www.eclipse.org/equinox/p2/2.0/metadata.xsd ">
 
-  <properties size="2">
+  <properties size="3">
     <property name="artifact.repo.connection.factory" value="org.eclipse.equinox.p2.artifact.repository.file.FileArtifactRepositoryFactory"/>
+    <property name="p2.compressed" value="false"/>
     <property name="p2.timestamp" value="1619203200000"/>
   </properties>
 
-  <units size="2">
+  <units size="3">
     <!-- Feature Unit -->
     <unit id="com.plaindb.dbeaver.feature.feature.group" version="1.0.0" singleton="false">
       <update id="com.plaindb.dbeaver.feature.feature.group" range="[0.0.0,1.0.0)" severity="0"/>
@@ -30,6 +31,31 @@
       <touchpointData size="1">
         <instructions size="1">
           <instruction key="install" value=""/>
+        </instructions>
+      </touchpointData>
+      <requires size="1">
+        <requirement namespace="org.eclipse.equinox.p2.iu" name="com.plaindb.dbeaver.feature.feature.jar" range="[1.0.0,1.0.0]" greedy="true"/>
+      </requires>
+    </unit>
+
+    <!-- Feature JAR Unit -->
+    <unit id="com.plaindb.dbeaver.feature.feature.jar" version="1.0.0" singleton="false">
+      <properties size="2">
+        <property name="org.eclipse.equinox.p2.name" value="PlainDB DBeaver Plugin"/>
+        <property name="org.eclipse.equinox.p2.provider" value="PlainDB"/>
+      </properties>
+      <provides size="2">
+        <provided namespace="org.eclipse.equinox.p2.iu" name="com.plaindb.dbeaver.feature.feature.jar" version="1.0.0"/>
+        <provided namespace="org.eclipse.update.feature" name="com.plaindb.dbeaver.feature" version="1.0.0"/>
+      </provides>
+      <filter/>
+      <artifacts size="1">
+        <artifact classifier="org.eclipse.update.feature" id="com.plaindb.dbeaver.feature" version="1.0.0"/>
+      </artifacts>
+      <touchpoint id="org.eclipse.equinox.p2.eclipse.type" version="1.0.0"/>
+      <touchpointData size="1">
+        <instructions size="1">
+          <instruction key="zipped" value="true"/>
         </instructions>
       </touchpointData>
       <requires size="1">

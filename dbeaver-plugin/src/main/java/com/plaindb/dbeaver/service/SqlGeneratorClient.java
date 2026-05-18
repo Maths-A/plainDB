@@ -8,269 +8,233 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Calls AI APIs (OpenAI, Gemini, local PlainDB service) to generate SQL.
+ * Backend-only PlainDB HTTP client.
+ *
+ * All SQL generation/execution/verification operations are delegated to backend endpoints.
  */
 public final class SqlGeneratorClient {
+    public interface ProgressListener {
+        void onProgress(String stage, String message);
+    }
+
     private final String apiKey;
-    private final String apiProvider; // "openai", "plaindb" or "gemini"
+    private final String provider;
     private final String endpointUrl;
     private final String llmModel;
 
-    public SqlGeneratorClient(String apiKey, String apiProvider, String endpointUrl, String llmModel) {
+    public SqlGeneratorClient(String apiKey, String provider, String endpointUrl, String llmModel) {
         this.apiKey = apiKey;
-        this.apiProvider = apiProvider;
+        this.provider = (provider == null || provider.isBlank()) ? "gemini" : provider;
         this.endpointUrl = endpointUrl;
         this.llmModel = (llmModel == null || llmModel.isBlank()) ? "gemini-2.5-flash" : llmModel;
     }
 
-    /**
-     * Generate SQL from a natural language request.
-     */
-    public String generateSql(String request, String databaseType) throws Exception {
-        if ("openai".equalsIgnoreCase(apiProvider)) {
-            return generateSqlViaOpenAI(request, databaseType);
-        } else if ("gemini".equalsIgnoreCase(apiProvider)) {
-            return generateSqlViaGemini(request, databaseType);
-        } else if ("plaindb".equalsIgnoreCase(apiProvider)) {
-            return generateSqlViaPlainDB(request, databaseType);
-        }
-
-        throw new IllegalArgumentException("Unknown API provider: " + apiProvider);
+    public static final class DatabaseTargetPayload {
+        public String dialect;
+        public String database;
+        public String username;
+        public String password;
+        public String host;
+        public Integer port;
+        public String schema;
+        public String connectionString;
     }
 
-    /**
-     * Explain database errors in beginner-friendly language.
-     */
-    public String explainDatabaseError(String databaseType, String sql, String errorMessage) throws Exception {
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalArgumentException("API key is required for Gemini explanation");
+    public static final class BackendRunResult {
+        public boolean accepted;
+        public boolean committed;
+        public int attempts;
+        public int rowcount;      // from execution.rowcount in the API response
+        public String generatedSql;
+        public String error;
+        public String errorKind;
+        public String rollbackId;
+        public String rawJson;
+    }
+
+    public BackendRunResult runBackend(String request, DatabaseTargetPayload target, boolean dryRun, int maxRetries) throws Exception {
+        if (endpointUrl == null || endpointUrl.isBlank()) {
+            throw new IllegalArgumentException("Backend URL is required for backend mode.");
         }
 
-        String model = llmModel;
-        String systemPrompt = "You are a patient SQL tutor for beginners. Explain database errors in very simple language. "
-            + "Return only plain text with 1 short sentence explanation and avoid technical jargon. If the error message contains sensitive information, do not include it in the explanation.";
+        String payload = buildBackendRunRequestJson(request, target, dryRun, maxRetries);
+        String response = callBackendApi("/run", "POST", payload);
 
-        String userPrompt = "Database type: " + (databaseType == null ? "unknown" : databaseType) + "\n"
-            + "SQL:\n" + (sql == null ? "(not available)" : sql) + "\n"
-            + "Error:\n" + (errorMessage == null ? "(not available)" : errorMessage) + "\n"
-            + "Keep it beginner-friendly and concrete.";
+        BackendRunResult result = new BackendRunResult();
+        result.rawJson = response;
+        result.accepted = extractJsonBoolean(response, "accepted");
+        result.committed = extractJsonBoolean(response, "committed");
+        result.attempts = extractJsonInt(response, "attempts", 0);
+        result.rowcount = extractJsonInt(response, "rowcount", 0);
+        result.generatedSql = valueOrDefault(extractJsonString(response, "generated_sql"), extractJsonString(response, "sql"));
+        result.error = extractJsonString(response, "error");
+        result.errorKind = extractJsonString(response, "error_kind");
+        result.rollbackId = extractJsonString(response, "rollback_id");
+        return result;
+    }
 
-        java.util.List<String> endpoints = new java.util.ArrayList<>();
-        endpoints.add("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent");
-        endpoints.add("https://generativelanguage.googleapis.com/v1/models/" + model + ":generateContent");
+    public BackendRunResult runBackendStream(
+        String request,
+        DatabaseTargetPayload target,
+        boolean dryRun,
+        int maxRetries,
+        ProgressListener progressListener
+    ) throws Exception {
+        if (endpointUrl == null || endpointUrl.isBlank()) {
+            throw new IllegalArgumentException("Backend URL is required for backend mode.");
+        }
 
-        IOException lastException = null;
-        for (String target : endpoints) {
-            boolean useApiKeyQuery = apiKey.startsWith("AIza");
-            String urlStr = target + (useApiKeyQuery && !target.contains("?") ? "?key=" + URLEncoder.encode(apiKey, StandardCharsets.UTF_8.name()) : "");
+        String payload = buildBackendRunRequestJson(request, target, dryRun, maxRetries);
+        String response = callBackendStreamApi("/run/stream", "POST", payload, progressListener);
 
-            try {
-                URL url = new URL(urlStr);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                if (!useApiKeyQuery) {
-                    conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-                }
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(30000);
-                conn.setDoOutput(true);
+        BackendRunResult result = new BackendRunResult();
+        result.rawJson = response;
+        result.accepted = extractJsonBoolean(response, "accepted");
+        result.committed = extractJsonBoolean(response, "committed");
+        result.attempts = extractJsonInt(response, "attempts", 0);
+        result.rowcount = extractJsonInt(response, "rowcount", 0);
+        result.generatedSql = valueOrDefault(extractJsonString(response, "generated_sql"), extractJsonString(response, "sql"));
+        result.error = extractJsonString(response, "error");
+        result.errorKind = extractJsonString(response, "error_kind");
+        result.rollbackId = extractJsonString(response, "rollback_id");
+        return result;
+    }
 
-                String jsonRequest = buildGeminiRequestJson(systemPrompt, userPrompt);
-                try (OutputStream os = conn.getOutputStream()) {
-                    os.write(jsonRequest.getBytes(StandardCharsets.UTF_8));
-                    os.flush();
-                }
+    public void applyRollback(String rollbackId) throws Exception {
+        if (rollbackId == null || rollbackId.isBlank()) {
+            throw new IllegalArgumentException("Rollback id is required.");
+        }
+        if (endpointUrl == null || endpointUrl.isBlank()) {
+            throw new IllegalArgumentException("Backend URL is required for rollback.");
+        }
+        callBackendApi("/rollback/" + URLEncoder.encode(rollbackId, StandardCharsets.UTF_8.name()), "POST", null);
+    }
 
-                int responseCode = conn.getResponseCode();
-                if (responseCode == 200) {
-                    String response = readResponse(conn);
-                    String text = extractSqlFromGeminiResponse(response);
-                    if (text != null && !text.isBlank()) {
-                        return text;
-                    }
-                    throw new IOException("Gemini explanation response was empty");
-                }
+    private String buildBackendRunRequestJson(String request, DatabaseTargetPayload target, boolean dryRun, int maxRetries) {
+        String dialect = valueOrDefault(target == null ? null : target.dialect, "sqlite");
+        String database = valueOrDefault(target == null ? null : target.database, ":memory:");
+        String username = target == null ? null : target.username;
+        String password = target == null ? null : target.password;
+        String host = target == null ? null : target.host;
+        Integer port = target == null ? null : target.port;
+        String schema = target == null ? null : target.schema;
+        String connectionString = target == null ? null : target.connectionString;
 
-                if (responseCode == 404) {
-                    continue;
-                }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{");
+        sb.append("\"intent_text\":\"").append(escapeJson(valueOrDefault(request, ""))).append("\",");
+        sb.append("\"api_key\":\"").append(escapeJson(valueOrDefault(apiKey, ""))).append("\",");
+        sb.append("\"provider\":\"").append(escapeJson(provider)).append("\",");
+        sb.append("\"model_name\":\"").append(escapeJson(llmModel)).append("\",");
+        sb.append("\"dry_run\":").append(dryRun).append(",");
+        sb.append("\"max_retries\":").append(Math.max(0, maxRetries)).append(",");
+        sb.append("\"database_target\":{");
+        sb.append("\"dialect\":\"").append(escapeJson(dialect)).append("\",");
+        sb.append("\"database\":\"").append(escapeJson(database)).append("\",");
+        appendOptionalString(sb, "username", username);
+        appendOptionalString(sb, "password", password);
+        appendOptionalString(sb, "host", host);
+        appendOptionalNumber(sb, "port", port);
+        appendOptionalString(sb, "schema", schema);
+        appendOptionalString(sb, "connection_string", connectionString);
+        sb.append("\"options\":{}");
+        sb.append("}");
+        sb.append("}");
+        return sb.toString();
+    }
 
-                String errBody = readResponseError(conn);
-                throw new IOException("Gemini explanation API returned status " + responseCode + ": " + errBody);
-            } catch (IOException e) {
-                lastException = e;
+    private String callBackendApi(String path, String method, String jsonBody) throws IOException {
+        String base = endpointUrl.endsWith("/") ? endpointUrl.substring(0, endpointUrl.length() - 1) : endpointUrl;
+        URL url = new URL(base + path);
+
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Connection", "keep-alive");
+        conn.setConnectTimeout(30000);
+        conn.setReadTimeout(60000);
+
+        if (jsonBody != null) {
+            conn.setDoOutput(true);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+                os.flush();
             }
         }
 
-        if (lastException != null) {
-            throw lastException;
+        int responseCode = conn.getResponseCode();
+        if (responseCode < 200 || responseCode >= 300) {
+            String err = readResponseError(conn);
+            throw new IOException("PlainDB backend returned status " + responseCode + ": " + err);
         }
-        throw new IOException("Gemini explanation API returned 404 for all attempted endpoints");
+
+        return readResponse(conn);
     }
 
-    private String generateSqlViaGemini(String request, String databaseType) throws Exception {
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalArgumentException("API key is required for Gemini");
-        }
+    private String callBackendStreamApi(
+        String path,
+        String method,
+        String jsonBody,
+        ProgressListener progressListener
+    ) throws IOException {
+        String base = endpointUrl.endsWith("/") ? endpointUrl.substring(0, endpointUrl.length() - 1) : endpointUrl;
+        URL url = new URL(base + path);
 
-        String model = llmModel;
-        String systemPrompt = "You are an expert SQL developer. Generate only valid " + databaseType +
-            " SQL code. No explanations, just the SQL statement.";
-        String userPrompt = "Generate SQL for: " + request;
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Content-Type", "application/json");
+        conn.setRequestProperty("Accept", "application/x-ndjson");
+        conn.setRequestProperty("Connection", "keep-alive");
+        conn.setConnectTimeout(30000);
+        conn.setReadTimeout(120000);
 
-        java.util.List<String> endpoints = new java.util.ArrayList<>();
-        if (endpointUrl != null && !endpointUrl.isBlank()) {
-            endpoints.add(endpointUrl.trim());
-        }
-        endpoints.add("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent");
-        endpoints.add("https://generativelanguage.googleapis.com/v1/models/" + model + ":generateContent");
-
-        IOException lastException = null;
-        for (String target : endpoints) {
-            boolean useApiKeyQuery = apiKey.startsWith("AIza");
-            String urlStr = target + (useApiKeyQuery && !target.contains("?") ? "?key=" + URLEncoder.encode(apiKey, StandardCharsets.UTF_8.name()) : "");
-
-            try {
-                URL url = new URL(urlStr);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                if (!useApiKeyQuery) {
-                    conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-                }
-                conn.setConnectTimeout(30000);
-                conn.setReadTimeout(60000);
-                conn.setDoOutput(true);
-
-                String jsonRequest = buildGeminiRequestJson(systemPrompt, userPrompt);
-                try (OutputStream os = conn.getOutputStream()) {
-                    os.write(jsonRequest.getBytes(StandardCharsets.UTF_8));
-                    os.flush();
-                }
-
-                int responseCode = conn.getResponseCode();
-                if (responseCode == 200) {
-                    String response = readResponse(conn);
-                    String sql = extractSqlFromGeminiResponse(response);
-                    if (sql != null && !sql.isBlank()) {
-                        return sql;
-                    }
-                    throw new IOException("Gemini response did not contain SQL text");
-                }
-
-                String errBody = readResponseError(conn);
-                System.err.println("[PlainDB][Gemini] Request URL: " + urlStr);
-                System.err.println("[PlainDB][Gemini] Response code: " + responseCode);
-                System.err.println("[PlainDB][Gemini] Error body: " + errBody);
-
-                if (responseCode == 404) {
-                    continue;
-                }
-
-                throw new IOException("Gemini API returned status " + responseCode + ": " + errBody);
-            } catch (IOException e) {
-                lastException = e;
-                System.err.println("[PlainDB][Gemini] Exception calling " + target + ": " + e.getMessage());
+        if (jsonBody != null) {
+            conn.setDoOutput(true);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+                os.flush();
             }
         }
 
-        if (lastException != null) {
-            throw lastException;
-        }
-        throw new IOException("Gemini API returned 404 for all attempted endpoints");
-    }
-
-    private String buildGeminiRequestJson(String systemPrompt, String userPrompt) {
-        return String.format(
-            "{\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"%s\"}]}],\"generationConfig\":{\"temperature\":0.2,\"maxOutputTokens\":1024}}",
-            escapeJson(systemPrompt),
-            escapeJson(userPrompt)
-        );
-    }
-
-    private String generateSqlViaOpenAI(String request, String databaseType) throws Exception {
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new IllegalArgumentException("API key is required for OpenAI");
-        }
-
-        String systemPrompt = "You are an expert SQL developer. Generate only valid " + databaseType +
-            " SQL code. No explanations, just the SQL statement.";
-        String userPrompt = "Generate SQL for: " + request;
-
-        String jsonRequest = String.format(
-            "{\"model\":\"gpt-3.5-turbo\",\"messages\":[" +
-            "{\"role\":\"system\",\"content\":\"%s\"}," +
-            "{\"role\":\"user\",\"content\":\"%s\"}" +
-            "],\"temperature\":0.3}",
-            escapeJson(systemPrompt),
-            escapeJson(userPrompt)
-        );
-
-        return callOpenAIAPI(jsonRequest);
-    }
-
-    private String generateSqlViaPlainDB(String request, String databaseType) throws Exception {
-        String jsonRequest = String.format(
-            "{\"prompt\":\"%s\",\"database_type\":\"%s\"}",
-            escapeJson(request),
-            databaseType
-        );
-
-        return callPlainDBAPI(jsonRequest);
-    }
-
-    private String callOpenAIAPI(String jsonBody) throws IOException {
-        URL url = new URL("https://api.openai.com/v1/chat/completions");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setRequestProperty("Authorization", "Bearer " + apiKey);
-        conn.setConnectTimeout(30000);
-        conn.setReadTimeout(60000);
-        conn.setDoOutput(true);
-
-        try (OutputStream os = conn.getOutputStream()) {
-            os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
-            os.flush();
-        }
-
         int responseCode = conn.getResponseCode();
-        if (responseCode != 200) {
+        if (responseCode < 200 || responseCode >= 300) {
             String err = readResponseError(conn);
-            System.err.println("[PlainDB][OpenAI] Request URL: " + url);
-            System.err.println("[PlainDB][OpenAI] Response code: " + responseCode);
-            System.err.println("[PlainDB][OpenAI] Error body: " + err);
-            throw new IOException("OpenAI API returned status " + responseCode + ": " + err);
+            throw new IOException("PlainDB backend returned status " + responseCode + ": " + err);
         }
 
-        return extractSqlFromOpenAIResponse(readResponse(conn));
-    }
-
-    private String callPlainDBAPI(String jsonBody) throws IOException {
-        URL url = new URL(endpointUrl + "/api/v1/generate-sql");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setConnectTimeout(30000);
-        conn.setReadTimeout(60000);
-        conn.setDoOutput(true);
-
-        try (OutputStream os = conn.getOutputStream()) {
-            os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
-            os.flush();
+        String finalLine = null;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+            new java.io.InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8)
+        )) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String trimmed = line.trim();
+                if (trimmed.isEmpty()) {
+                    continue;
+                }
+                String event = extractJsonString(trimmed, "event");
+                if ("progress".equals(event)) {
+                    if (progressListener != null) {
+                        String stage = valueOrDefault(extractJsonString(trimmed, "stage"), "progress");
+                        String message = valueOrDefault(extractJsonString(trimmed, "message"), stage);
+                        progressListener.onProgress(stage, message);
+                    }
+                    continue;
+                }
+                if ("error".equals(event)) {
+                    String error = valueOrDefault(extractJsonString(trimmed, "error"), "Streaming execution failed.");
+                    throw new IOException(error);
+                }
+                if ("final".equals(event)) {
+                    finalLine = trimmed;
+                }
+            }
         }
 
-        int responseCode = conn.getResponseCode();
-        if (responseCode != 200) {
-            String err = readResponseError(conn);
-            System.err.println("[PlainDB][Local] Request URL: " + url);
-            System.err.println("[PlainDB][Local] Response code: " + responseCode);
-            System.err.println("[PlainDB][Local] Error body: " + err);
-            throw new IOException("PlainDB API returned status " + responseCode + ": " + err);
+        if (finalLine == null || finalLine.isBlank()) {
+            throw new IOException("Streaming backend did not return a final result.");
         }
-
-        return extractSqlFromPlainDBResponse(readResponse(conn));
+        return finalLine;
     }
 
     private String readResponse(HttpURLConnection conn) throws IOException {
@@ -303,78 +267,112 @@ public final class SqlGeneratorClient {
         }
     }
 
-    private String extractSqlFromOpenAIResponse(String jsonResponse) {
-        try {
-            int contentStart = jsonResponse.indexOf("\"content\":\"");
-            if (contentStart == -1) {
-                return "-- Error parsing OpenAI response";
+    private String extractJsonString(String json, String key) {
+        if (json == null || key == null) {
+            return null;
+        }
+        String pattern = "\"" + key + "\":\"";
+        int start = json.indexOf(pattern);
+        if (start < 0) {
+            return null;
+        }
+        start += pattern.length();
+        StringBuilder out = new StringBuilder();
+        boolean escaped = false;
+        for (int i = start; i < json.length(); i++) {
+            char ch = json.charAt(i);
+            if (escaped) {
+                switch (ch) {
+                    case 'n': out.append('\n'); break;
+                    case 'r': out.append('\r'); break;
+                    case 't': out.append('\t'); break;
+                    case '"': out.append('"'); break;
+                    case '\\': out.append('\\'); break;
+                    default: out.append(ch); break;
+                }
+                escaped = false;
+                continue;
             }
-            contentStart += 11;
-            int contentEnd = jsonResponse.indexOf('"', contentStart);
-            String content = jsonResponse.substring(contentStart, contentEnd);
-            content = content.replace("\\n", "\n");
-            content = content.replace("\\\"", "\"");
-            content = content.replace("\\\\", "\\");
-            return content;
-        } catch (Exception e) {
-            return "-- Error extracting SQL: " + e.getMessage();
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"') {
+                return out.toString();
+            }
+            out.append(ch);
+        }
+        return null;
+    }
+
+    private boolean extractJsonBoolean(String json, String key) {
+        if (json == null || key == null) {
+            return false;
+        }
+        String truePattern = "\"" + key + "\":true";
+        String falsePattern = "\"" + key + "\":false";
+        if (json.contains(truePattern)) {
+            return true;
+        }
+        if (json.contains(falsePattern)) {
+            return false;
+        }
+        return false;
+    }
+
+    private int extractJsonInt(String json, String key, int defaultValue) {
+        if (json == null || key == null) {
+            return defaultValue;
+        }
+        String pattern = "\"" + key + "\":";
+        int start = json.indexOf(pattern);
+        if (start < 0) {
+            return defaultValue;
+        }
+        start += pattern.length();
+        int end = start;
+        while (end < json.length() && Character.isDigit(json.charAt(end))) {
+            end++;
+        }
+        if (end == start) {
+            return defaultValue;
+        }
+        try {
+            return Integer.parseInt(json.substring(start, end));
+        } catch (Exception ignored) {
+            return defaultValue;
         }
     }
 
-    private String extractSqlFromGeminiResponse(String jsonResponse) {
-        try {
-            int cand = jsonResponse.indexOf("\"candidates\"");
-            if (cand != -1) {
-                int textIdx = jsonResponse.indexOf("\"text\"", cand);
-                if (textIdx != -1) {
-                    int start = jsonResponse.indexOf(':', textIdx) + 1;
-                    int quote = jsonResponse.indexOf('"', start);
-                    if (quote != -1) {
-                        int end = jsonResponse.indexOf('"', quote + 1);
-                        if (end != -1) {
-                            String output = jsonResponse.substring(quote + 1, end);
-                            output = output.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
-                            return output;
-                        }
-                    }
-                }
-            }
-
-            int out = jsonResponse.indexOf("\"text\":\"");
-            if (out != -1) {
-                int s = out + 8;
-                int e = jsonResponse.indexOf('"', s);
-                if (e != -1) {
-                    String output = jsonResponse.substring(s, e);
-                    return output.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\");
-                }
-            }
-
-            return "-- Error: could not parse Gemini response";
-        } catch (Exception e) {
-            return "-- Error extracting Gemini SQL: " + e.getMessage();
+    private void appendOptionalString(StringBuilder sb, String key, String value) {
+        sb.append("\"").append(key).append("\":");
+        if (value == null || value.isBlank()) {
+            sb.append("null,");
+            return;
         }
+        sb.append("\"").append(escapeJson(value)).append("\",");
     }
 
-    private String extractSqlFromPlainDBResponse(String jsonResponse) {
-        try {
-            int sqlStart = jsonResponse.indexOf("\"sql\":\"");
-            if (sqlStart == -1) {
-                return "-- Error parsing PlainDB response";
-            }
-            sqlStart += 7;
-            int sqlEnd = jsonResponse.indexOf('"', sqlStart);
-            String sql = jsonResponse.substring(sqlStart, sqlEnd);
-            sql = sql.replace("\\n", "\n");
-            sql = sql.replace("\\\"", "\"");
-            sql = sql.replace("\\\\", "\\");
-            return sql;
-        } catch (Exception e) {
-            return "-- Error extracting SQL: " + e.getMessage();
+    private void appendOptionalNumber(StringBuilder sb, String key, Integer value) {
+        sb.append("\"").append(key).append("\":");
+        if (value == null) {
+            sb.append("null,");
+            return;
         }
+        sb.append(value).append(',');
+    }
+
+    private String valueOrDefault(String value, String defaultValue) {
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+        return value;
     }
 
     private String escapeJson(String text) {
+        if (text == null) {
+            return "";
+        }
         return text.replace("\\", "\\\\")
                    .replace("\"", "\\\"")
                    .replace("\n", "\\n")

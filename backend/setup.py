@@ -14,6 +14,8 @@ setup(
         "fastapi>=0.104.0",
         "uvicorn[standard]>=0.24.0",
         "pydantic>=2.0.0",
+        "psycopg2-binary>=2.9.9",
+        "PyMySQL>=1.1.0",
     ],
     extras_require={
         "dev": [

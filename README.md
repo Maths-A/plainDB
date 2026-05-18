@@ -16,31 +16,30 @@
 **DBeaver Plugin** (`dbeaver-plugin/`)
 - User interface for SQL generation
 - Communicates with backend via REST API
-- Provides AI integration (OpenAI, Gemini)
-- Can also call PlainDB backend locally or remotely
+- Uses backend-driven AI execution (API key is forwarded to backend)
+- Supports backend rollback IDs and rollback actions from the UI
 
 ### Verification Pipeline
 
-Both services implement a **five-stage verification flow**. At a high level these steps are:
+The backend currently runs a **six-stage architecture pipeline**:
 
-1. Intent
-  PlainDB reads your request and figures out what you want. It expects a clear English sentence, such as "show all rows from people."
+1. Schema introspection
+  Loads database schema metadata used by downstream generation and verification steps.
 
-2. Safety
-  The tool checks whether the request is safe and usable before generating SQL. This is where it can reject unclear, unsupported, or non-English input.
+2. AI SQL generation
+  Generates SQL from the English request and target database context.
 
-3. Target
-  You choose the database connection that PlainDB should use. That tells the tool which schema to work against and where to execute the query.
+3. AI SQL verification
+  Performs model-assisted semantic/safety checks on generated SQL.
 
-4. API
-  PlainDB sends the request to the configured AI backend or model. The AI writes SQL for the chosen database type.
+4. AI verification-query planning
+  Produces deterministic verification queries used to evaluate execution effects.
 
-5. SQL (verification & execution)
-  - Semantic Verification: Ensures user intent matches generated SQL.
-  - Safety Verification: Detects harmful or policy-violating SQL.
-  - Transaction Execution: Runs SQL inside a transaction.
-  - In-Transaction Effect: Validates changes match user intent while still in the transaction.
-  - Post-Commit Verification: Confirms final database state after commit.
+5. Transactional execution
+  Executes SQL inside a transaction boundary with adapter-specific behavior.
+
+6. Result verification and retry classification
+  Verifies observed effects and classifies failures to decide accept/reject/retry.
 
 If something fails other than a simple SQL-generation problem, PlainDB will try to explain the error in beginner-friendly language and may attempt guided regeneration where appropriate.
 
@@ -128,14 +127,14 @@ bash ../scripts/install-to-dbeaver.sh
 - Enter natural language request
 - See generated and verified SQL
 
-### Option 3: DBeaver Plugin with AI
-
-**Configure AI provider (OpenAI or Gemini):**
+### Option 3: DBeaver Plugin Account Setup
 
 1. Install DBeaver plugin as above
-2. In dialog: Select "OpenAI" or "Gemini (Google)"
-3. Enter your API key
-4. Generate and execute SQL
+2. In dialog Account tab:
+  - Backend URL: `http://localhost:8000` (or your deployed backend)
+  - LLM model: `gemini-2.5-flash`
+  - API key/token: entered once and stored locally in plugin preferences
+3. Run requests from SQL Assistant tab
 
 ## Backend Testing
 
@@ -183,10 +182,27 @@ PLAINDB_DB_PATH=plaindb.sqlite  # Database file path
 ### DBeaver Plugin Configuration
 
 Configure in DBeaver dialog:
-- **Provider**: Local PlainDB, OpenAI, or Gemini
-- **Backend URL**: For remote backend (e.g., `http://your-server:8000`)
-- **API Key**: For OpenAI/Gemini (optional)
+- **Backend URL**: For local/remote backend (e.g., `http://your-server:8000`)
+- **LLM Model**: Model passed to backend (default `gemini-2.5-flash`)
+- **API Key**: Forwarded to backend for provider authentication
 - **Database Type**: Target database system
+
+## Rollback Model
+
+### How rollback snapshots are created
+
+For mutating SQL, backend creates a pre-change snapshot and returns a `rollback_id` in `/run` response. The plugin stores that ID with the corresponding "Before request" snapshot entry.
+
+### What rollback restores
+
+- **Backend rollback** (`POST /rollback/{rollback_id}`): restores actual database state.
+- **Local rollback snapshot**: restores plugin UI state only (prompt/output/history context), not database state.
+
+The rollback selector is backend-first by default, and entries are tagged (`[backend]` / `[local]`) so the scope is clear.
+
+### Where rollback data is stored
+
+Backend stores snapshot files under a temp rollback directory (for example `<tmp>/plaindb-rollbacks`) and persists snapshot metadata in `snapshot-index.json` so rollback IDs survive backend restarts when snapshot files still exist.
 
 ## Documentation
 
@@ -280,13 +296,14 @@ The callback returns a new SQL candidate for the next attempt.
 
 ## Extending to Any Database
 
-Implement `DatabaseAdapter` in `plain_db/interfaces.py` for each DB engine:
-- PostgreSQL (`psycopg`)
-- MySQL (`mysqlclient` or `pymysql`)
-- SQL Server (`pyodbc`)
-- Oracle (`oracledb`)
+Currently implemented backend adapters:
+- SQLite
+- PostgreSQL (`postgres`, `postgresql`, `pg`)
+- MySQL/MariaDB (`mysql`, `mariadb`)
 
-No pipeline logic changes are required when swapping adapters.
+To add more engines, implement `DatabaseAdapter` in `plain_db/interfaces.py` for each target DB (for example SQL Server via `pyodbc`, Oracle via `oracledb`).
+
+No core pipeline logic changes are required when swapping adapters.
 
 ## DBeaver Plugin Integration
 
@@ -312,8 +329,8 @@ Creates a local p2 update site, then in DBeaver:
 ### Design Rules
 
 - User-facing text must be English only
-- SQL must stay hidden from the UI
-- Plugin shows approval, rollback, retry, and final status only
-- PlainDB owns semantic verification, safety checks, and retry logic
+- Backend is the source of truth for commit and rollback
+- Plugin clearly separates backend rollback from local UI snapshots
+- PlainDB backend owns semantic verification, safety checks, and retry logic
 
 See [dbeaver-plugin/README.md](dbeaver-plugin/README.md) and [update-site/README.md](update-site/README.md) for detailed instructions.

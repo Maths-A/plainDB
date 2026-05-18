@@ -8,6 +8,7 @@ import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.SelectionAdapter;
 import org.eclipse.swt.events.SelectionEvent;
+import org.eclipse.swt.layout.FillLayout;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.*;
@@ -35,12 +36,17 @@ import org.jkiss.dbeaver.model.struct.DBSInstance;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.prefs.Preferences;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class PlainDbMainDialog extends Dialog {
     private static final int ROLLBACK_ID = IDialogConstants.CLIENT_ID + 1;
     private static final String DEFAULT_BACKEND_URL = "http://127.0.0.1:8000";
+    private static final long EXECUTE_COOLDOWN_MS = 800;
+    private static final String PREF_API_KEY = "apiKey";
+    private static final String PREF_BACKEND_URL = "backendUrl";
+    private static final String PREF_MODEL = "model";
 
     private Text apiKeyText;
     private Combo modelCombo;
@@ -54,11 +60,15 @@ public final class PlainDbMainDialog extends Dialog {
     private Button applyEditsButton;
     private Combo rollbackCombo;
     private Button rollbackSelectedButton;
+    private Button showLocalSnapshotsCheck;
+    private Text rollbackStatusText;
     private TableViewer resultTableViewer;
     private List<RowData> resultRows = new ArrayList<>();
     private String[] resultColumnNames = new String[0];
     private Text historyText;
     private final Label[] stepBubbles = new Label[5];
+    private Composite resultAreaComposite;
+    private Label resultTitleLabel;
     
     private String apiKey;
     private String selectedDatabase;
@@ -67,10 +77,16 @@ public final class PlainDbMainDialog extends Dialog {
     private String output;
     private String lastGeneratedSql;
     private boolean requestGenerated;
+    private boolean executeInProgress;
+    private long executeCooldownUntilMs;
+    private long rateLimitUntilMs;
     private StringBuilder requestHistory = new StringBuilder();
     private final List<DBPDataSourceContainer> databaseTargets = new ArrayList<>();
     private final List<RollbackSnapshot> rollbackSnapshots = new ArrayList<>();
+    private final List<RollbackSnapshot> displayedRollbackSnapshots = new ArrayList<>();
     private final EnglishOnlyGuard englishOnlyGuard = new EnglishOnlyGuard();
+    private RollbackSnapshot pendingRequestSnapshot;
+    private final Preferences preferences = Preferences.userNodeForPackage(PlainDbMainDialog.class);
 
     public PlainDbMainDialog(Shell parentShell) {
         super(parentShell);
@@ -135,8 +151,9 @@ public final class PlainDbMainDialog extends Dialog {
 
         backendUrlText = new Text(backendRow, SWT.BORDER);
         backendUrlText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
-        backendUrlText.setText(DEFAULT_BACKEND_URL);
+        backendUrlText.setText(valueOrDefault(loadPreference(PREF_BACKEND_URL), DEFAULT_BACKEND_URL));
         backendUrlText.setMessage("https://<your-backend>/ (Cloud Function, Cloud Run, local backend, etc.)");
+        backendUrlText.addModifyListener(e -> saveAccountPreferences());
 
         Button connectBackendButton = new Button(backendRow, SWT.PUSH);
         connectBackendButton.setText("Connect Backend");
@@ -163,6 +180,19 @@ public final class PlainDbMainDialog extends Dialog {
         modelCombo.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
         modelCombo.setItems(new String[] { "gemini-2.5-flash" });
         modelCombo.select(0);
+        String savedModel = loadPreference(PREF_MODEL);
+        if (savedModel != null && !savedModel.isBlank()) {
+            int savedIndex = modelCombo.indexOf(savedModel);
+            if (savedIndex >= 0) {
+                modelCombo.select(savedIndex);
+            }
+        }
+        modelCombo.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                saveAccountPreferences();
+            }
+        });
 
         // === API Key Section ===
         Label apiKeyLabel = new Label(container, SWT.NONE);
@@ -171,7 +201,9 @@ public final class PlainDbMainDialog extends Dialog {
 
         apiKeyText = new Text(container, SWT.BORDER | SWT.PASSWORD);
         apiKeyText.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+        apiKeyText.setText(valueOrDefault(loadPreference(PREF_API_KEY), ""));
         apiKeyText.setMessage("Enter your Gemini API key (AIza...) or OAuth token");
+        apiKeyText.addModifyListener(e -> saveAccountPreferences());
 
         // === API Status Info ===
         Label infoLabel = new Label(container, SWT.WRAP);
@@ -188,8 +220,8 @@ public final class PlainDbMainDialog extends Dialog {
             "   Currently supported: gemini-2.5-flash\n\n" +
             "3) Enter your Gemini API key (or OAuth token).\n\n" +
             "Notes:\n" +
-            "• If backend URL points to a PlainDB backend, it should expose /health and /api/v1/generate-sql.\n" +
-            "• If backend URL is empty, the plugin uses Gemini's public API endpoints.\n" +
+            "• If backend URL points to a PlainDB backend, it should expose /health, /run, and rollback endpoints.\n" +
+            "• Backend URL is required. Requests are sent only to the backend.\n" +
             "• For production on Google Cloud, prefer short-lived OAuth tokens over long-lived API keys.\n"
         );
 
@@ -285,8 +317,8 @@ public final class PlainDbMainDialog extends Dialog {
         promptLabel.setLayoutData(promptLabelData);
 
         promptText = new Text(container, SWT.BORDER | SWT.MULTI | SWT.WRAP | SWT.V_SCROLL);
-        GridData promptData = new GridData(SWT.FILL, SWT.FILL, true, true);
-        promptData.heightHint = 68;
+        GridData promptData = new GridData(SWT.FILL, SWT.TOP, true, false);
+        promptData.heightHint = 80;
         promptText.setLayoutData(promptData);
         promptText.setMessage("Describe what SQL operation you want to perform");
 
@@ -331,23 +363,26 @@ public final class PlainDbMainDialog extends Dialog {
         outputLabel.setLayoutData(outputLabelData);
 
         outputText = new Text(container, SWT.BORDER | SWT.MULTI | SWT.WRAP | SWT.V_SCROLL | SWT.READ_ONLY);
-        GridData outputData = new GridData(SWT.FILL, SWT.CENTER, true, false);
-        outputData.heightHint = 24;
+        GridData outputData = new GridData(SWT.FILL, SWT.FILL, true, false);
+        outputData.heightHint = 120;
         outputText.setLayoutData(outputData);
 
-        Label resultLabel = new Label(container, SWT.NONE);
-        resultLabel.setText("Table result:");
+        resultTitleLabel = new Label(container, SWT.NONE);
+        resultTitleLabel.setText("Table result:");
         GridData resultLabelData = new GridData(SWT.LEFT, SWT.TOP, false, false);
         resultLabelData.verticalIndent = 5;
-        resultLabel.setLayoutData(resultLabelData);
+        resultTitleLabel.setLayoutData(resultLabelData);
 
-        // Create a TableViewer in the second column for editable, scrollable results
-        resultTableViewer = new TableViewer(container, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL);
+        // Container for the result area — swapped between a single TableViewer and a TabFolder
+        resultAreaComposite = new Composite(container, SWT.NONE);
+        resultAreaComposite.setLayout(new FillLayout());
+        GridData resultAreaData = new GridData(SWT.FILL, SWT.FILL, true, true);
+        resultAreaComposite.setLayoutData(resultAreaData);
+
+        resultTableViewer = new TableViewer(resultAreaComposite, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL);
         Table table = resultTableViewer.getTable();
         table.setHeaderVisible(true);
         table.setLinesVisible(true);
-        GridData tableData = new GridData(SWT.FILL, SWT.FILL, true, true);
-        table.setLayoutData(tableData);
         // Content provider and label provider will be configured when filling data
 
         Composite applyRow = new Composite(container, SWT.NONE);
@@ -415,6 +450,29 @@ public final class PlainDbMainDialog extends Dialog {
                 rollbackSelectedSnapshot();
             }
         });
+
+        showLocalSnapshotsCheck = new Button(container, SWT.CHECK);
+        showLocalSnapshotsCheck.setText("Show local UI snapshots (no backend rollback)");
+        GridData localCheckData = new GridData(SWT.FILL, SWT.CENTER, true, false);
+        localCheckData.horizontalSpan = 1;
+        showLocalSnapshotsCheck.setLayoutData(localCheckData);
+        showLocalSnapshotsCheck.setSelection(false);
+        showLocalSnapshotsCheck.addSelectionListener(new SelectionAdapter() {
+            @Override
+            public void widgetSelected(SelectionEvent e) {
+                refreshRollbackChooser();
+            }
+        });
+
+        Label rollbackStatusLabel = new Label(container, SWT.NONE);
+        rollbackStatusLabel.setText("Rollback audit:");
+        rollbackStatusLabel.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false));
+
+        rollbackStatusText = new Text(container, SWT.BORDER | SWT.MULTI | SWT.WRAP | SWT.V_SCROLL | SWT.READ_ONLY);
+        GridData rollbackStatusData = new GridData(SWT.FILL, SWT.FILL, true, false);
+        rollbackStatusData.heightHint = 96;
+        rollbackStatusText.setLayoutData(rollbackStatusData);
+        rollbackStatusText.setText("No rollback operations yet.");
 
         // Clear History Button
         Button clearHistoryBtn = new Button(container, SWT.PUSH);
@@ -600,6 +658,21 @@ public final class PlainDbMainDialog extends Dialog {
     }
 
     private void executeRequest() {
+        long now = System.currentTimeMillis();
+        if (executeInProgress) {
+            outputText.setText("A request is already running. Please wait for it to finish.");
+            return;
+        }
+        if (now < rateLimitUntilMs) {
+            long secondsLeft = Math.max(1L, (long) Math.ceil((rateLimitUntilMs - now) / 1000.0));
+            outputText.setText("Rate limit in effect. Please retry in about " + secondsLeft + " second(s).");
+            return;
+        }
+        if (now < executeCooldownUntilMs) {
+            outputText.setText("Please wait a moment before running another request.");
+            return;
+        }
+
         String request = promptText.getText().trim();
         if (request.isEmpty()) {
             outputText.setText("Error: Please enter a request.");
@@ -608,7 +681,7 @@ public final class PlainDbMainDialog extends Dialog {
             return;
         }
 
-        saveRollbackSnapshot("Before request: " + summarizeRequest(request));
+        pendingRequestSnapshot = saveRollbackSnapshot("Before request: " + summarizeRequest(request), null, null);
 
         if (!englishOnlyGuard.isEnglishOnly(request)) {
             outputText.setText("Error: Request must be in English.");
@@ -638,76 +711,242 @@ public final class PlainDbMainDialog extends Dialog {
             selectedDatabaseType = "default";
         }
 
+        resetStepBubbles();
         setStepState(0, StepState.PASS);
         setStepState(1, StepState.PASS);
         setStepState(2, StepState.PASS);
         setStepState(3, StepState.ACTIVE);
+        resetResultArea();
 
-        performSqlGeneration(request);
+        saveAccountPreferences();
+        String apiKey = apiKeyText == null ? "" : apiKeyText.getText();
+        String endpointUrl = null;
+        if (backendUrlText != null && backendUrlText.getText() != null && !backendUrlText.getText().isBlank()) {
+            endpointUrl = backendUrlText.getText().trim();
+        }
+        String llmModel = "gemini-2.5-flash";
+        if (modelCombo != null && modelCombo.getSelectionIndex() >= 0) {
+            llmModel = modelCombo.getText();
+        }
+        SqlGeneratorClient.DatabaseTargetPayload targetPayload = buildBackendTargetPayload();
+        final String requestText = request;
+        final String apiKeyValue = apiKey;
+        final String endpointUrlValue = endpointUrl;
+        final String llmModelValue = llmModel;
+        final SqlGeneratorClient.DatabaseTargetPayload targetPayloadValue = targetPayload;
+
+        setExecuteBusy(true);
+        outputText.setText("Starting backend pipeline...");
+        Thread worker = new Thread(
+            () -> performSqlGeneration(requestText, apiKeyValue, endpointUrlValue, llmModelValue, targetPayloadValue),
+            "plaindb-runner"
+        );
+        worker.setDaemon(true);
+        worker.start();
     }
 
-    private void performSqlGeneration(String request) {
+    private void setExecuteBusy(boolean busy) {
+        executeInProgress = busy;
+        if (executeButton == null || executeButton.isDisposed()) {
+            return;
+        }
+        executeButton.setEnabled(!busy);
+        executeButton.setText(busy ? "Running..." : "Execute request");
+    }
+
+    private void performSqlGeneration(
+        String request,
+        String apiKey,
+        String endpointUrl,
+        String llmModel,
+        SqlGeneratorClient.DatabaseTargetPayload targetPayload
+    ) {
         try {
-            String apiKey = apiKeyText.getText();
             if (apiKey == null || apiKey.isBlank()) {
-                outputText.setText("Error: Please provide a Gemini API key in Account tab.");
-                setStepState(3, StepState.FAIL);
-                setStepState(4, StepState.FAIL);
+                runOnUiThread(() -> {
+                    outputText.setText("Error: Please provide a Gemini API key in Account tab.");
+                    setStepState(3, StepState.FAIL);
+                    setStepState(4, StepState.FAIL);
+                });
+                return;
+            }
+
+            if (endpointUrl == null || endpointUrl.isBlank()) {
+                runOnUiThread(() -> {
+                    outputText.setText("Error: Backend URL is required. Configure it in Account tab.");
+                    showSqlButton.setEnabled(false);
+                    setStepState(3, StepState.FAIL);
+                    setStepState(4, StepState.FAIL);
+                });
                 return;
             }
 
             String apiProvider = "gemini";
 
-            String endpointUrl = null;
-            if (backendUrlText != null && !backendUrlText.getText().isBlank()) {
-                endpointUrl = backendUrlText.getText().trim();
-            }
-
-            String llmModel = "gemini-2.5-flash";
-            if (modelCombo != null && modelCombo.getSelectionIndex() >= 0) {
-                llmModel = modelCombo.getText();
-            }
-
             SqlGeneratorClient client = new SqlGeneratorClient(apiKey, apiProvider, endpointUrl, llmModel);
-            String sql = client.generateSql(request, selectedDatabaseType);
 
-            if (sql != null && !sql.isEmpty()) {
-                lastGeneratedSql = sanitizeGeneratedSql(sql);
-                // SQL generation succeeded -> API step is a pass
+            SqlGeneratorClient.BackendRunResult runResult = client.runBackendStream(
+                request,
+                targetPayload,
+                false,
+                0,
+                (stage, message) -> appendOutputLineAsync("• " + message)
+            );
+
+            runOnUiThread(() -> {
+                lastGeneratedSql = sanitizeGeneratedSql(runResult.generatedSql == null ? "" : runResult.generatedSql);
                 setStepState(3, StepState.PASS);
-                try {
-                    String tableResult = executeSqlAndFormatTable(lastGeneratedSql);
-                    outputText.setText(tableResult);
-                    requestGenerated = true;
-                    showSqlButton.setEnabled(true);
-                    setStepState(4, StepState.PASS);
 
-                    String timestamp = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date());
-                    requestHistory.append("[").append(timestamp).append("] (").append(selectedDatabase).append(")\n")
-                        .append("Request: ").append(promptText.getText()).append("\n")
-                        .append("Output:\n").append(tableResult).append("\n\n")
-                        .append("SQL: ").append(lastGeneratedSql).append("\n\n");
-                    historyText.setText(requestHistory.toString());
-                } catch (Exception execEx) {
-                    // Execution failed (database error) — API call itself worked
-                    outputText.setText(buildBeginnerFriendlyError(execEx, lastGeneratedSql));
+                if (runResult.generatedSql == null || runResult.generatedSql.isBlank()) {
+                    outputText.setText("Error: Backend did not return generated SQL." +
+                        (runResult.error == null || runResult.error.isBlank() ? "" : "\n" + runResult.error));
                     showSqlButton.setEnabled(false);
-                    setStepState(3, StepState.PASS);
                     setStepState(4, StepState.FAIL);
                     return;
                 }
-            } else {
-                outputText.setText("Error: No SQL generated. Try again or check your backend.");
+
+                String resultSummary;
+                if (!runResult.accepted) {
+                    resultSummary = "Request rejected by backend verification.";
+                    if (runResult.error != null && !runResult.error.isBlank()) {
+                        resultSummary += "\n" + runResult.error;
+                    }
+                    outputText.setText(resultSummary);
+                    showSqlButton.setEnabled(true);
+                    setStepState(4, StepState.FAIL);
+                    return;
+                }
+
+                boolean mutating = isMutatingSql(lastGeneratedSql);
+                if (!mutating) {
+                    try {
+                        String tableResult = executeSqlAndFormatTable(lastGeneratedSql);
+                        outputText.setText(tableResult);
+                        resultSummary = tableResult;
+                    } catch (Exception selectPreviewError) {
+                        resultSummary = "Backend committed successfully, but local preview failed: " + selectPreviewError.getMessage();
+                        outputText.setText(resultSummary);
+                    }
+                } else {
+                    String rowsNote = runResult.rowcount > 0
+                        ? " (" + runResult.rowcount + " row" + (runResult.rowcount == 1 ? "" : "s") + " affected)"
+                        : "";
+                    resultSummary = "Committed" + rowsNote +
+                        "\nAttempts: " + runResult.attempts +
+                        (runResult.rollbackId == null || runResult.rollbackId.isBlank() ? "" : "\nRollback ID: " + runResult.rollbackId);
+                    outputText.setText(resultSummary);
+                    fetchAndDisplayAfterMutation(lastGeneratedSql);
+                }
+
+                requestGenerated = true;
+                showSqlButton.setEnabled(true);
+                setStepState(4, runResult.committed ? StepState.PASS : StepState.FAIL);
+
+                if (runResult.rollbackId != null && !runResult.rollbackId.isBlank()) {
+                    if (pendingRequestSnapshot != null) {
+                        pendingRequestSnapshot.backendRollbackId = runResult.rollbackId;
+                        pendingRequestSnapshot.backendBaseUrl = endpointUrl;
+                    } else {
+                        saveRollbackSnapshot("Backend rollback: " + runResult.rollbackId, runResult.rollbackId, endpointUrl);
+                    }
+                    refreshRollbackChooser();
+                    appendRollbackAudit("Rollback checkpoint saved", runResult.rollbackId);
+                }
+
+                String timestamp = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date());
+                requestHistory.append("[").append(timestamp).append("] (").append(selectedDatabase).append(")\n")
+                    .append("Request: ").append(request).append("\n")
+                    .append("Output:\n").append(resultSummary).append("\n\n")
+                    .append("SQL: ").append(lastGeneratedSql).append("\n");
+                if (runResult.rollbackId != null && !runResult.rollbackId.isBlank()) {
+                    requestHistory.append("Rollback ID: ").append(runResult.rollbackId).append("\n");
+                }
+                requestHistory.append("\n");
+                historyText.setText(requestHistory.toString());
+            });
+        } catch (Exception e) {
+            String technicalMessage = e == null ? "" : (e.getMessage() == null ? e.toString() : e.getMessage());
+            long rateLimitDelaySeconds = extractRetryDelaySeconds(technicalMessage);
+            if (rateLimitDelaySeconds > 0) {
+                rateLimitUntilMs = Math.max(rateLimitUntilMs, System.currentTimeMillis() + (rateLimitDelaySeconds * 1000L));
+            }
+            runOnUiThread(() -> {
+                outputText.setText(buildBeginnerFriendlyError(e, lastGeneratedSql));
                 showSqlButton.setEnabled(false);
                 setStepState(3, StepState.FAIL);
                 setStepState(4, StepState.FAIL);
-            }
-        } catch (Exception e) {
-            outputText.setText(buildBeginnerFriendlyError(e, lastGeneratedSql));
-            showSqlButton.setEnabled(false);
-            setStepState(3, StepState.FAIL);
-            setStepState(4, StepState.FAIL);
+            });
+        } finally {
+            runOnUiThread(() -> {
+                setExecuteBusy(false);
+                executeCooldownUntilMs = System.currentTimeMillis() + EXECUTE_COOLDOWN_MS;
+                pendingRequestSnapshot = null;
+            });
         }
+    }
+
+    private void appendOutputLineAsync(String line) {
+        runOnUiThread(() -> {
+            if (outputText == null || outputText.isDisposed()) {
+                return;
+            }
+            String existing = outputText.getText();
+            if (existing == null || existing.isBlank()) {
+                outputText.setText(line);
+                return;
+            }
+            outputText.setText(existing + "\n" + line);
+        });
+    }
+
+    private String loadPreference(String key) {
+        try {
+            return preferences.get(key, null);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void saveAccountPreferences() {
+        try {
+            if (apiKeyText != null && !apiKeyText.isDisposed()) {
+                preferences.put(PREF_API_KEY, valueOrDefault(apiKeyText.getText(), ""));
+            }
+            if (backendUrlText != null && !backendUrlText.isDisposed()) {
+                String backendUrl = valueOrDefault(backendUrlText.getText(), "").trim();
+                preferences.put(PREF_BACKEND_URL, backendUrl.isBlank() ? DEFAULT_BACKEND_URL : backendUrl);
+            }
+            if (modelCombo != null && !modelCombo.isDisposed()) {
+                preferences.put(PREF_MODEL, valueOrDefault(modelCombo.getText(), "gemini-2.5-flash"));
+            }
+            preferences.flush();
+        } catch (Exception ignored) {
+            // Ignore persistence failures and keep dialog functional.
+        }
+    }
+
+    private String valueOrDefault(String value, String fallback) {
+        return value == null ? fallback : value;
+    }
+
+    private void runOnUiThread(Runnable action) {
+        if (action == null) {
+            return;
+        }
+        Shell shell = getShell();
+        if (shell == null || shell.isDisposed()) {
+            return;
+        }
+        Display display = shell.getDisplay();
+        if (display == null || display.isDisposed()) {
+            return;
+        }
+        display.asyncExec(() -> {
+            if (shell.isDisposed()) {
+                return;
+            }
+            action.run();
+        });
     }
 
     private void showGeneratedSql() {
@@ -921,7 +1160,7 @@ public final class PlainDbMainDialog extends Dialog {
             outputText.setText("No results to apply.");
             return;
         }
-        saveRollbackSnapshot("Before table update: " + summarizeSql(lastGeneratedSql));
+        saveRollbackSnapshot("Before table update: " + summarizeSql(lastGeneratedSql), null, null);
         // assume first column is primary key
         int pkIndex = 0;
         DBPDataSourceContainer container = getSelectedDataSourceContainer();
@@ -1052,47 +1291,50 @@ public final class PlainDbMainDialog extends Dialog {
 
     private String buildBeginnerFriendlyError(Exception e, String sqlContext) {
         String technicalMessage = e == null ? "Unknown error" : (e.getMessage() == null ? e.toString() : e.getMessage());
-        try {
-            String apiKey = apiKeyText == null ? null : apiKeyText.getText();
-            if (apiKey == null || apiKey.isBlank()) {
-                return "What happened: " + technicalMessage
-                    + "\nWhy it happened: The database rejected the SQL or connection details."
-                    + "\nHow to fix it now: Check selected database, table/column names, then try again.";
-            }
+        String lower = technicalMessage.toLowerCase();
+        if (lower.contains("status 429") || lower.contains("resource_exhausted") || lower.contains("quota exceeded") || lower.contains("rate limit")) {
+            String retryHint = extractRetryHint(technicalMessage);
+            return "What happened: The Gemini API quota/rate limit was exceeded."
+                + "\nWhy it happened: Too many requests were sent for the current plan or free-tier limit."
+                + "\nHow to fix it now: Wait and retry" + retryHint + ", or switch to a higher quota/billing plan in Gemini.";
+        }
+        return "What happened: " + technicalMessage
+            + "\nWhy it happened: The backend rejected the request or execution context."
+            + "\nHow to fix it now: Check backend URL, credentials, selected database, and retry.";
+    }
 
-            String endpointUrl = null;
-            if (backendUrlText != null && backendUrlText.getText() != null && !backendUrlText.getText().isBlank()) {
-                endpointUrl = backendUrlText.getText().trim();
-            }
+    private String extractRetryHint(String technicalMessage) {
+        long seconds = extractRetryDelaySeconds(technicalMessage);
+        if (seconds > 0) {
+            return " (about " + seconds + " seconds)";
+        }
+        return "";
+    }
 
-            String llmModel = "gemini-2.5-flash";
-            if (modelCombo != null && modelCombo.getSelectionIndex() >= 0) {
-                llmModel = modelCombo.getText();
+    private long extractRetryDelaySeconds(String technicalMessage) {
+        if (technicalMessage == null || technicalMessage.isBlank()) {
+            return 0L;
+        }
+        Pattern retryInfoPattern = Pattern.compile("retryDelay\\\"\\s*:\\s*\\\"(\\d+)s\\\"", Pattern.CASE_INSENSITIVE);
+        Matcher retryInfoMatcher = retryInfoPattern.matcher(technicalMessage);
+        if (retryInfoMatcher.find()) {
+            try {
+                return Long.parseLong(retryInfoMatcher.group(1));
+            } catch (Exception ignored) {
+                return 0L;
             }
-
-            SqlGeneratorClient client = new SqlGeneratorClient(apiKey, "gemini", endpointUrl, llmModel);
-            String aiExplanation = client.explainDatabaseError(selectedDatabaseType, sqlContext, technicalMessage);
-            if (aiExplanation != null && !aiExplanation.isBlank()) {
-                // Validate AI output: reject obviously malformed explanations (e.g. unpaired quotes
-                // or extremely short/empty responses that contain dangling placeholders).
-                String trimmed = aiExplanation.trim();
-                int quoteCount = 0;
-                for (char c : trimmed.toCharArray()) if (c == '"') quoteCount++;
-                boolean badQuotes = (quoteCount % 2) != 0;
-                boolean tooShort = trimmed.length() < 12;
-                boolean suspiciousEmptyQuoted = trimmed.contains("\"\"") || trimmed.matches(".*The table named\\s*\\\"\\s*.*");
-                if (!badQuotes && !tooShort && !suspiciousEmptyQuoted) {
-                    return aiExplanation;
-                }
-                // else fall through to static beginner message below
-            }
-        } catch (Exception ignored) {
-            // fall back to static beginner message
         }
 
-        return "What happened: " + technicalMessage
-            + "\nWhy it happened: The SQL did not match the database schema or permissions."
-            + "\nHow to fix it now: Open Show Generated SQL, verify table/column names, and retry.";
+        Pattern retryInPattern = Pattern.compile("retry in\\s+([0-9]+(?:\\.[0-9]+)?)s", Pattern.CASE_INSENSITIVE);
+        Matcher retryInMatcher = retryInPattern.matcher(technicalMessage);
+        if (retryInMatcher.find()) {
+            try {
+                return (long) Math.ceil(Double.parseDouble(retryInMatcher.group(1)));
+            } catch (Exception ignored) {
+                return 0L;
+            }
+        }
+        return 0L;
     }
 
     private String formatResultSetAsTable(DBCResultSet rs, int maxRows) throws Exception {
@@ -1212,18 +1454,22 @@ public final class PlainDbMainDialog extends Dialog {
         }
     }
 
-    private void saveRollbackSnapshot(String label) {
+    private RollbackSnapshot saveRollbackSnapshot(String label, String backendRollbackId, String backendBaseUrl) {
         if (promptText == null || outputText == null) {
-            return;
+            return null;
         }
-        rollbackSnapshots.add(new RollbackSnapshot(
+        RollbackSnapshot snapshot = new RollbackSnapshot(
             label,
             promptText.getText(),
             outputText.getText(),
             selectedDatabase,
-            selectedDatabaseType
-        ));
+            selectedDatabaseType,
+            backendRollbackId,
+            backendBaseUrl
+        );
+        rollbackSnapshots.add(snapshot);
         refreshRollbackChooser();
+        return snapshot;
     }
 
     private void refreshRollbackChooser() {
@@ -1231,8 +1477,17 @@ public final class PlainDbMainDialog extends Dialog {
             return;
         }
 
-        if (rollbackSnapshots.isEmpty()) {
-            rollbackCombo.setItems(new String[] { "No rollback snapshots" });
+        displayedRollbackSnapshots.clear();
+        boolean includeLocalSnapshots =
+            showLocalSnapshotsCheck != null && !showLocalSnapshotsCheck.isDisposed() && showLocalSnapshotsCheck.getSelection();
+        for (RollbackSnapshot snapshot : rollbackSnapshots) {
+            if (snapshot.hasBackendRollbackId() || includeLocalSnapshots) {
+                displayedRollbackSnapshots.add(snapshot);
+            }
+        }
+
+        if (displayedRollbackSnapshots.isEmpty()) {
+            rollbackCombo.setItems(new String[] { "No backend rollback snapshots" });
             rollbackCombo.select(0);
             rollbackCombo.setEnabled(false);
             if (rollbackSelectedButton != null && !rollbackSelectedButton.isDisposed()) {
@@ -1241,9 +1496,9 @@ public final class PlainDbMainDialog extends Dialog {
             return;
         }
 
-        String[] items = new String[rollbackSnapshots.size()];
-        for (int i = 0; i < rollbackSnapshots.size(); i++) {
-            items[i] = rollbackSnapshots.get(i).displayLabel(i);
+        String[] items = new String[displayedRollbackSnapshots.size()];
+        for (int i = 0; i < displayedRollbackSnapshots.size(); i++) {
+            items[i] = displayedRollbackSnapshots.get(i).displayLabel(i);
         }
         rollbackCombo.setItems(items);
         rollbackCombo.select(items.length - 1);
@@ -1254,27 +1509,55 @@ public final class PlainDbMainDialog extends Dialog {
     }
 
     private void rollbackSelectedSnapshot() {
-        if (rollbackSnapshots.isEmpty() || rollbackCombo == null) {
+        if (displayedRollbackSnapshots.isEmpty() || rollbackCombo == null) {
             return;
         }
 
         int index = rollbackCombo.getSelectionIndex();
-        if (index < 0 || index >= rollbackSnapshots.size()) {
+        if (index < 0 || index >= displayedRollbackSnapshots.size()) {
             return;
         }
 
-        RollbackSnapshot snapshot = rollbackSnapshots.get(index);
+        RollbackSnapshot snapshot = displayedRollbackSnapshots.get(index);
+        boolean backendRollbackApplied = true;
+
+        if (snapshot.backendRollbackId != null && !snapshot.backendRollbackId.isBlank()) {
+            appendRollbackAudit("Requesting backend rollback", snapshot.backendRollbackId);
+            backendRollbackApplied = applyBackendRollback(snapshot);
+        } else {
+            appendRollbackAudit("Restored local snapshot", null);
+        }
+
+        if (!backendRollbackApplied) {
+            MessageDialog.openError(
+                getShell(),
+                "Rollback Failed",
+                "The backend rollback did not complete. Local snapshot state was not restored."
+            );
+            return;
+        }
+
+        String rollbackMessage;
+        if (snapshot.backendRollbackId != null && !snapshot.backendRollbackId.isBlank()) {
+            rollbackMessage = "Rollback applied successfully for ID: " + snapshot.backendRollbackId;
+        } else {
+            rollbackMessage = "Local snapshot restored (no backend rollback ID for this snapshot).";
+        }
+
         promptText.setText(snapshot.prompt);
         outputText.setText(snapshot.output);
         selectedDatabase = snapshot.selectedDatabase;
         selectedDatabaseType = snapshot.selectedDatabaseType;
         resetStepBubbles();
 
-        if (index < rollbackSnapshots.size() - 1) {
-            rollbackSnapshots.subList(index + 1, rollbackSnapshots.size()).clear();
+        int fullIndex = rollbackSnapshots.indexOf(snapshot);
+        if (fullIndex >= 0) {
+            // Remove the applied snapshot itself and any newer snapshots.
+            rollbackSnapshots.subList(fullIndex, rollbackSnapshots.size()).clear();
         }
         refreshRollbackChooser();
-        historyText.setText(historyText.getText() + "\n\nRolled back to: " + snapshot.label);
+        historyText.setText(historyText.getText() + "\n\nRolled back to: " + snapshot.label + "\n" + rollbackMessage);
+        MessageDialog.openInformation(getShell(), "Rollback Completed", rollbackMessage);
     }
 
     private String summarizeRequest(String request) {
@@ -1310,12 +1593,39 @@ public final class PlainDbMainDialog extends Dialog {
         if (buttonId == ROLLBACK_ID) {
             if (!rollbackSnapshots.isEmpty()) {
                 RollbackSnapshot previous = rollbackSnapshots.remove(rollbackSnapshots.size() - 1);
+                boolean backendRollbackApplied = true;
+                if (previous.backendRollbackId != null && !previous.backendRollbackId.isBlank()) {
+                    appendRollbackAudit("Requesting backend rollback", previous.backendRollbackId);
+                    backendRollbackApplied = applyBackendRollback(previous);
+                } else {
+                    appendRollbackAudit("Restored local snapshot", null);
+                }
+
+                if (!backendRollbackApplied) {
+                    rollbackSnapshots.add(previous);
+                    refreshRollbackChooser();
+                    MessageDialog.openError(
+                        getShell(),
+                        "Rollback Failed",
+                        "The backend rollback did not complete. Snapshot was kept so you can retry."
+                    );
+                    return;
+                }
+
+                String rollbackMessage;
+                if (previous.backendRollbackId != null && !previous.backendRollbackId.isBlank()) {
+                    rollbackMessage = "Rollback applied successfully for ID: " + previous.backendRollbackId;
+                } else {
+                    rollbackMessage = "Local snapshot restored (no backend rollback ID for this snapshot).";
+                }
+
                 promptText.setText(previous.prompt);
                 outputText.setText(previous.output);
                 selectedDatabase = previous.selectedDatabase;
                 selectedDatabaseType = previous.selectedDatabaseType;
                 resetStepBubbles();
                 refreshRollbackChooser();
+                MessageDialog.openInformation(getShell(), "Rollback Completed", rollbackMessage);
             }
         } else {
             super.buttonPressed(buttonId);
@@ -1332,18 +1642,350 @@ public final class PlainDbMainDialog extends Dialog {
         String output;
         String selectedDatabase;
         String selectedDatabaseType;
+        String backendRollbackId;
+        String backendBaseUrl;
 
-        RollbackSnapshot(String label, String prompt, String output, String selectedDatabase, String selectedDatabaseType) {
+        RollbackSnapshot(
+            String label,
+            String prompt,
+            String output,
+            String selectedDatabase,
+            String selectedDatabaseType,
+            String backendRollbackId,
+            String backendBaseUrl
+        ) {
             this.label = label;
             this.prompt = prompt;
             this.output = output;
             this.selectedDatabase = selectedDatabase;
             this.selectedDatabaseType = selectedDatabaseType;
+            this.backendRollbackId = backendRollbackId;
+            this.backendBaseUrl = backendBaseUrl;
         }
 
         String displayLabel(int index) {
-            return (index + 1) + ": " + label;
+            return (index + 1) + ": " + (hasBackendRollbackId() ? "[backend] " : "[local] ") + label;
         }
+
+        boolean hasBackendRollbackId() {
+            return backendRollbackId != null && !backendRollbackId.isBlank();
+        }
+    }
+
+    private boolean isMutatingSql(String sql) {
+        if (sql == null) {
+            return false;
+        }
+        String trimmed = sql.trim();
+        // Skip leading comments and semicolons for robust SQL verb detection.
+        trimmed = trimmed.replaceFirst("^(?:\\s|;+|--[^\\n]*\\n|/\\*.*?\\*/)+", "");
+        trimmed = trimmed.toLowerCase();
+        return trimmed.startsWith("insert")
+            || trimmed.startsWith("update")
+            || trimmed.startsWith("delete")
+            || trimmed.startsWith("create")
+            || trimmed.startsWith("alter")
+            || trimmed.startsWith("drop")
+            || trimmed.startsWith("truncate");
+    }
+
+    private boolean applyBackendRollback(RollbackSnapshot snapshot) {
+        try {
+            String apiKey = apiKeyText == null ? "" : apiKeyText.getText();
+            String endpoint = snapshot.backendBaseUrl;
+            if (endpoint == null || endpoint.isBlank()) {
+                endpoint = backendUrlText == null ? null : backendUrlText.getText();
+            }
+            if (endpoint == null || endpoint.isBlank()) {
+                outputText.setText("Rollback failed: backend URL is missing for rollback ID " + snapshot.backendRollbackId);
+                return false;
+            }
+
+            String llmModel = "gemini-2.5-flash";
+            if (modelCombo != null && modelCombo.getSelectionIndex() >= 0) {
+                llmModel = modelCombo.getText();
+            }
+
+            SqlGeneratorClient client = new SqlGeneratorClient(apiKey, "gemini", endpoint.trim(), llmModel);
+            client.applyRollback(snapshot.backendRollbackId);
+            outputText.setText("Backend rollback applied for ID: " + snapshot.backendRollbackId);
+            appendRollbackAudit("Backend rollback applied", snapshot.backendRollbackId);
+            return true;
+        } catch (Exception rollbackError) {
+            outputText.setText("Rollback failed: " + rollbackError.getMessage());
+            appendRollbackAudit("Backend rollback failed: " + rollbackError.getMessage(), snapshot.backendRollbackId);
+            return false;
+        }
+    }
+
+    private void appendRollbackAudit(String message, String rollbackId) {
+        if (rollbackStatusText == null || rollbackStatusText.isDisposed()) {
+            return;
+        }
+        String timestamp = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date());
+        StringBuilder line = new StringBuilder();
+        line.append("[").append(timestamp).append("] ").append(message);
+        if (rollbackId != null && !rollbackId.isBlank()) {
+            line.append(" (id=").append(rollbackId).append(")");
+        }
+
+        String existing = rollbackStatusText.getText();
+        if (existing == null || existing.isBlank() || "No rollback operations yet.".equals(existing.trim())) {
+            rollbackStatusText.setText(line.toString());
+        } else {
+            rollbackStatusText.setText(existing + "\n" + line);
+        }
+    }
+
+    private SqlGeneratorClient.DatabaseTargetPayload buildBackendTargetPayload() {
+        SqlGeneratorClient.DatabaseTargetPayload payload = new SqlGeneratorClient.DatabaseTargetPayload();
+        payload.dialect = selectedDatabaseType;
+
+        DBPDataSourceContainer container = getSelectedDataSourceContainer();
+        if (container == null) {
+            payload.database = ":memory:";
+            return payload;
+        }
+
+        Object cfg = null;
+        try {
+            cfg = container.getClass().getMethod("getConnectionConfiguration").invoke(container);
+        } catch (Exception ignored) {
+            cfg = null;
+        }
+
+        payload.database = readStringViaReflection(cfg, "getDatabaseName");
+        payload.username = readStringViaReflection(cfg, "getUserName");
+        payload.password = readStringViaReflection(cfg, "getUserPassword");
+        payload.host = readStringViaReflection(cfg, "getHostName");
+        payload.schema = readStringViaReflection(cfg, "getCurrentSchema");
+        payload.connectionString = readStringViaReflection(cfg, "getUrl");
+        payload.port = readIntegerViaReflection(cfg, "getHostPort");
+
+        if (payload.database == null || payload.database.isBlank()) {
+            payload.database = readStringViaReflection(cfg, "getDatabase");
+        }
+        if ((payload.database == null || payload.database.isBlank()) && payload.dialect != null && payload.dialect.toLowerCase().contains("sqlite")) {
+            payload.database = readStringViaReflection(cfg, "getUrl");
+        }
+        if (payload.database == null || payload.database.isBlank()) {
+            payload.database = ":memory:";
+        }
+
+        return payload;
+    }
+
+    private String readStringViaReflection(Object target, String methodName) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            Object value = target.getClass().getMethod(methodName).invoke(target);
+            return value == null ? null : String.valueOf(value);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private Integer readIntegerViaReflection(Object target, String methodName) {
+        String raw = readStringViaReflection(target, methodName);
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    // -------- Post-mutation result display --------
+
+    /** Resets the result area to a fresh single-TableViewer state. */
+    private void resetResultArea() {
+        if (resultAreaComposite == null || resultAreaComposite.isDisposed()) return;
+        for (org.eclipse.swt.widgets.Control c : resultAreaComposite.getChildren()) c.dispose();
+        resultAreaComposite.setLayout(new FillLayout());
+        resultTableViewer = new TableViewer(resultAreaComposite, SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL);
+        resultTableViewer.getTable().setHeaderVisible(true);
+        resultTableViewer.getTable().setLinesVisible(true);
+        resultRows.clear();
+        resultColumnNames = new String[0];
+        if (resultTitleLabel != null && !resultTitleLabel.isDisposed()) {
+            resultTitleLabel.setText("Table result:");
+        }
+        resultAreaComposite.layout(true, true);
+    }
+
+    /**
+     * After a mutating SQL is committed, extracts the affected table(s) from the
+     * generated SQL and populates the result area with a live SELECT snapshot.
+     * Must be called on the UI thread.
+     */
+    private void fetchAndDisplayAfterMutation(String sql) {
+        List<String> tables = extractAffectedTableNames(sql);
+        if (tables.isEmpty()) return;
+        if (tables.size() == 1) {
+            String tableName = tables.get(0);
+            try {
+                executeSqlAndFormatTable("SELECT * FROM " + tableName + " LIMIT 100");
+                if (resultTitleLabel != null && !resultTitleLabel.isDisposed()) {
+                    resultTitleLabel.setText("Table: " + tableName);
+                }
+            } catch (Exception ignored) {
+                // Non-fatal — table preview is best-effort
+            }
+        } else {
+            showMultipleTablesResult(tables);
+        }
+    }
+
+    /**
+     * Builds a TabFolder inside resultAreaComposite, one tab per affected table,
+     * each populated with a read-only SELECT snapshot. Must be called on the UI thread.
+     */
+    private void showMultipleTablesResult(List<String> tables) {
+        if (resultAreaComposite == null || resultAreaComposite.isDisposed()) return;
+        for (org.eclipse.swt.widgets.Control c : resultAreaComposite.getChildren()) c.dispose();
+        resultRows.clear();
+        resultColumnNames = new String[0];
+        resultAreaComposite.setLayout(new FillLayout());
+
+        TabFolder tabs = new TabFolder(resultAreaComposite, SWT.NONE);
+        for (String tableName : tables) {
+            TabItem tabItem = new TabItem(tabs, SWT.NONE);
+            tabItem.setText(tableName);
+
+            Composite tabComp = new Composite(tabs, SWT.NONE);
+            tabComp.setLayout(new FillLayout());
+            tabItem.setControl(tabComp);
+
+            TableViewer tv = new TableViewer(tabComp,
+                SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL | SWT.H_SCROLL | SWT.READ_ONLY);
+            tv.getTable().setHeaderVisible(true);
+            tv.getTable().setLinesVisible(true);
+            try {
+                populateViewerFromTable(tv, tableName, 100);
+            } catch (Exception ignored) {
+                // Leave the tab empty on error
+            }
+        }
+
+        if (resultTitleLabel != null && !resultTitleLabel.isDisposed()) {
+            resultTitleLabel.setText("Tables (" + tables.size() + " affected):");
+        }
+        resultAreaComposite.layout(true, true);
+    }
+
+    /**
+     * Executes {@code SELECT * FROM tableName LIMIT limit} via the selected DB connection,
+     * builds columns and rows on {@code tv}, and returns the column names.
+     * Must be called on the UI thread (consistent with existing executeSqlAndFormatTable).
+     */
+    private String[] populateViewerFromTable(TableViewer tv, String tableName, int limit) throws Exception {
+        DBPDataSourceContainer dsContainer = getSelectedDataSourceContainer();
+        if (dsContainer == null) return new String[0];
+        DBRProgressMonitor monitor = new VoidProgressMonitor();
+        if (!dsContainer.isConnected()) dsContainer.connect(monitor, true, false);
+        DBPDataSource dataSource = dsContainer.getDataSource();
+        if (dataSource == null) return new String[0];
+        DBSInstance instance = dataSource.getDefaultInstance();
+        if (instance == null) return new String[0];
+        DBCExecutionContext context = instance.getDefaultContext(monitor, true);
+        if (context == null) return new String[0];
+
+        try (DBCSession session = context.openSession(monitor, DBCExecutionPurpose.USER, "PlainDB table preview");
+             DBCStatement stmt = session.prepareStatement(DBCStatementType.QUERY,
+                 "SELECT * FROM " + tableName + " LIMIT " + limit, false, false, false)) {
+            stmt.setLimit(0, limit);
+            if (!stmt.executeStatement()) return new String[0];
+            try (DBCResultSet rs = stmt.openResultSet()) {
+                DBCResultSetMetaData meta = rs.getMeta();
+                List<? extends DBCAttributeMetaData> attrs =
+                    meta == null ? java.util.Collections.emptyList() : meta.getAttributes();
+                int cols = attrs.size();
+                String[] colNames = new String[cols];
+                for (int i = 0; i < cols; i++) {
+                    DBCAttributeMetaData a = attrs.get(i);
+                    String lbl = a == null ? null : a.getLabel();
+                    if (lbl == null || lbl.isBlank()) lbl = a == null ? ("col_" + (i + 1)) : a.getName();
+                    colNames[i] = lbl;
+                }
+
+                // Build columns on the viewer
+                for (int i = 0; i < colNames.length; i++) {
+                    final int colIdx = i;
+                    TableViewerColumn tvc = new TableViewerColumn(tv, SWT.NONE);
+                    tvc.getColumn().setText(colNames[i]);
+                    tvc.getColumn().setWidth(150);
+                    tvc.setLabelProvider(new ColumnLabelProvider() {
+                        @Override public String getText(Object element) {
+                            if (element instanceof RowData) {
+                                Object v = ((RowData) element).cells[colIdx];
+                                return v == null ? "NULL" : String.valueOf(v);
+                            }
+                            return "";
+                        }
+                    });
+                }
+
+                // Collect rows
+                List<RowData> rows = new ArrayList<>();
+                while (rs.nextRow() && rows.size() < limit) {
+                    RowData rd = new RowData(cols);
+                    for (int i = 0; i < cols; i++) rd.cells[i] = rs.getAttributeValue(i);
+                    rd.markOriginal();
+                    rows.add(rd);
+                }
+
+                tv.setContentProvider(new IStructuredContentProvider() {
+                    @Override public Object[] getElements(Object input) { return rows.toArray(new RowData[0]); }
+                    @Override public void dispose() {}
+                    @Override public void inputChanged(Viewer v, Object o, Object n) {}
+                });
+                tv.setInput(this);
+                return colNames;
+            }
+        }
+    }
+
+    /** Extracts the table(s) affected by an INSERT / UPDATE / DELETE statement. */
+    private List<String> extractAffectedTableNames(String sql) {
+        if (sql == null || sql.isBlank()) return new ArrayList<>();
+        List<String> tables = new ArrayList<>();
+        String text = sql.trim();
+
+        // INSERT INTO <table>
+        Pattern insertPat = Pattern.compile("(?i)^\\s*INSERT\\s+INTO\\s+([\\w\\.\"\\`]+)");
+        Matcher insertMat = insertPat.matcher(text);
+        if (insertMat.find()) {
+            tables.add(insertMat.group(1));
+            return tables;
+        }
+
+        // UPDATE <table> [JOIN <joined_table> ...]
+        Pattern updatePat = Pattern.compile("(?i)^\\s*UPDATE\\s+([\\w\\.\"\\`]+)");
+        Matcher updateMat = updatePat.matcher(text);
+        if (updateMat.find()) {
+            tables.add(updateMat.group(1));
+            Pattern joinPat = Pattern.compile("(?i)\\bJOIN\\s+([\\w\\.\"\\`]+)");
+            Matcher joinMat = joinPat.matcher(text);
+            while (joinMat.find()) {
+                String jt = joinMat.group(1);
+                if (!tables.contains(jt)) tables.add(jt);
+            }
+            return tables;
+        }
+
+        // DELETE FROM <table>
+        Pattern deletePat = Pattern.compile("(?i)^\\s*DELETE\\s+FROM\\s+([\\w\\.\"\\`]+)");
+        Matcher deleteMat = deletePat.matcher(text);
+        if (deleteMat.find()) {
+            tables.add(deleteMat.group(1));
+            return tables;
+        }
+
+        return tables;
     }
 
 }

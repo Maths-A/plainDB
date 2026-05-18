@@ -1,77 +1,66 @@
 import sqlite3
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional
+from typing import List, Optional
 
-from ..interfaces import DatabaseAdapter, TransactionHandle
-from ..models import ExecutionResult
-
-INVALID_TRANSACTION_HANDLE = "Invalid transaction handle"
+from ..schema import SchemaColumn, SchemaForeignKey
+from .dbapi_adapter import DBAPIConnectionAdapter
 
 
-@dataclass
-class SQLiteTransaction(TransactionHandle):
-    conn: sqlite3.Connection
-    closed: bool = False
-
-    def commit(self) -> None:
-        if not self.closed:
-            self.conn.commit()
-            self.closed = True
-
-    def rollback(self) -> None:
-        if not self.closed:
-            self.conn.rollback()
-            self.closed = True
-
-
-class SQLiteAdapter(DatabaseAdapter):
+class SQLiteAdapter(DBAPIConnectionAdapter):
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path)
-        self._conn.row_factory = sqlite3.Row
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        super().__init__(conn)
 
-    @contextmanager
-    def begin(self) -> Generator[TransactionHandle, None, None]:
-        tx = SQLiteTransaction(self._conn)
-        self._conn.execute("BEGIN")
+    def dialect_name(self) -> str:
+        return "sqlite"
+
+    def list_tables(self) -> List[str]:
+        table_rows = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        return [table_row["name"] for table_row in table_rows]
+
+    def describe_columns(self, table_name: str) -> List[SchemaColumn]:
+        table_info = self._conn.execute(f"PRAGMA table_info({self.quote_identifier(table_name)})").fetchall()
+        return [
+            SchemaColumn(
+                name=row["name"],
+                data_type=row["type"] or "TEXT",
+                not_null=bool(row["notnull"]),
+                default_value=row["dflt_value"],
+                primary_key_ordinal=int(row["pk"] or 0),
+            )
+            for row in table_info
+        ]
+
+    def describe_foreign_keys(self, table_name: str) -> List[SchemaForeignKey]:
+        foreign_key_rows = self._conn.execute(
+            f"PRAGMA foreign_key_list({self.quote_identifier(table_name)})"
+        ).fetchall()
+        return [
+            SchemaForeignKey(
+                column=row["from"],
+                referenced_table=row["table"],
+                referenced_column=row["to"],
+                on_update=row["on_update"],
+                on_delete=row["on_delete"],
+            )
+            for row in foreign_key_rows
+        ]
+
+    def count_rows(self, table_name: str) -> Optional[int]:
         try:
-            yield tx
-        finally:
-            if not tx.closed:
-                tx.rollback()
+            row_count_result = self._conn.execute(
+                f"SELECT COUNT(*) AS c FROM {self.quote_identifier(table_name)}"
+            ).fetchone()
+            if row_count_result is not None:
+                return int(row_count_result["c"])
+        except sqlite3.Error:
+            return None
+        return None
 
-    def execute(self, tx: TransactionHandle, sql: str, params: Optional[Dict[str, Any]] = None) -> ExecutionResult:
-        if not isinstance(tx, SQLiteTransaction):
-            return ExecutionResult(success=False, rowcount=0, error=INVALID_TRANSACTION_HANDLE)
-
-        try:
-            cursor = tx.conn.execute(sql, params or {})
-            rowcount = cursor.rowcount if cursor.rowcount is not None else 0
-            return ExecutionResult(success=True, rowcount=rowcount)
-        except sqlite3.Error as exc:
-            return ExecutionResult(success=False, rowcount=0, error=str(exc))
-
-    def query(self, tx: Optional[TransactionHandle], sql: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        conn = self._conn
-        if tx is not None:
-            if not isinstance(tx, SQLiteTransaction):
-                raise TypeError(INVALID_TRANSACTION_HANDLE)
-            conn = tx.conn
-
-        cursor = conn.execute(sql, params or {})
-        rows = cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    def snapshot(self, tx: TransactionHandle, watched_tables: List[str]) -> Dict[str, Any]:
-        if not isinstance(tx, SQLiteTransaction):
-            raise TypeError(INVALID_TRANSACTION_HANDLE)
-
-        snapshot: Dict[str, Any] = {}
-        for table in watched_tables:
-            rows = self.query(tx, f"SELECT COUNT(*) AS c FROM {table}")
-            snapshot[table] = rows[0]["c"]
-        return snapshot
-
-    def close(self) -> None:
-        self._conn.close()
+    @staticmethod
+    def quote_identifier(identifier: str) -> str:
+        safe_identifier = identifier.replace('"', '""')
+        return f'"{safe_identifier}"'

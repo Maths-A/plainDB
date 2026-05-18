@@ -2,20 +2,25 @@
 
 The **PlainDB Backend** is a containerized REST API service that provides SQL generation, verification, and execution capabilities. It can be deployed independently and accessed by clients like the DBeaver plugin or other applications.
 
+The current DBeaver plugin integration is **backend-only**: the plugin acts as a thin interface and sends request execution through backend endpoints (`/run`, rollback APIs).
+
 ## Architecture Overview
 
 ```
 PlainDB Backend
 ├── REST API Layer (FastAPI)
-│   └── HTTP endpoints for SQL operations
-├── Pipeline Engine
-│   ├── Semantic Verification
-│   ├── Safety Verification
-│   ├── Effect Verification
-│   ├── Post-commit Verification
-│   └── Database Execution
+│   └── /run accepts the English explanation, AI provider/key, and database credentials
+├── Architecture Pipeline
+│   ├── Schema introspection
+│   ├── AI SQL generation
+│   ├── AI SQL verification
+│   ├── AI verification-query planning
+│   ├── Transactional execution
+│   └── Result verification and retry classification
 └── Database Adapters
-    └── SQLite Adapter (extensible for other DBs)
+  ├── SQLite Adapter
+  ├── PostgreSQL Adapter
+  └── MySQL Adapter
 ```
 
 ## Quick Start
@@ -37,6 +42,10 @@ pip install -e ".[dev]"
 
 # Install dependencies
 pip install -r requirements.txt
+
+# If you plan to use PostgreSQL or MySQL, the backend installs their drivers too.
+# PostgreSQL: psycopg2-binary
+# MySQL: PyMySQL
 ```
 
 **Run the Server:**
@@ -100,6 +109,31 @@ pytest tests/test_pipeline.py -v
 
 # API tests only
 pytest tests/test_api.py -v
+
+# Architecture pipeline tests
+pytest tests/test_architecture.py -v
+
+# Adapter routing tests
+pytest tests/test_adapter_factory.py -v
+
+# Safety regression tests
+pytest tests/test_safety_regressions.py -v
+
+# Real-pipeline API integration tests
+pytest tests/test_api_integration.py -v
+
+# LLM provider failure-mode tests
+pytest tests/test_llm.py -v
+```
+
+**Optional Real DB Smoke Tests (PostgreSQL/MySQL):**
+
+```bash
+# Provide DSNs only when you want to run live adapter smoke tests
+export PLAINDB_TEST_POSTGRES_DSN='postgresql://user:pass@localhost:5432/your_db'
+export PLAINDB_TEST_MYSQL_DSN='mysql://user:pass@localhost:3306/your_db'
+
+pytest tests/test_adapter_smoke.py -v
 ```
 
 **Run Tests in Docker:**
@@ -124,36 +158,50 @@ Returns service status:
 ```json
 {
   "status": "ok",
-  "service": "plaindb-backend",
-  "database": "/path/to/db"
+  "default_provider": "gemini",
+  "default_database": ":memory:",
+  "default_model": null
 }
 ```
 
-### Service Info
+### Root Endpoint
 
 ```bash
-GET /api/v1/info
+GET /
 ```
 
-Returns available endpoints and configuration.
+Returns a short contract reminder for clients.
 
-### Generate SQL
+### Run Request
 
 ```bash
-POST /api/v1/generate-sql
+POST /run
 ```
 
-Generate and execute SQL based on natural language intent.
+Generate SQL from English, verify it with schema-aware AI prompts, execute it in a transaction, and verify the result.
+
+Supported dialects: `sqlite`, `postgres`, `postgresql`, `pg`, `mysql`, and `mariadb`.
 
 **Request:**
 ```json
 {
   "intent_text": "Show all users older than 25",
-  "expected_tables": ["users"],
-  "expected_action": "SELECT",
-  "dry_run": false,
-  "watched_tables": ["users"],
-  "model_name": "gemini-2.5-flash"
+  "api_key": "YOUR_AI_KEY",
+  "provider": "gemini",
+  "model_name": "gemini-2.5-flash",
+  "dry_run": true,
+  "max_retries": 1,
+  "database_target": {
+    "dialect": "postgresql",
+    "database": "plaindb",
+    "username": null,
+    "password": null,
+    "host": "localhost",
+    "port": 5432,
+    "schema": null,
+    "connection_string": null,
+    "options": {}
+  }
 }
 ```
 
@@ -161,49 +209,77 @@ Generate and execute SQL based on natural language intent.
 ```json
 {
   "accepted": true,
-  "committed": true,
+  "committed": false,
+  "rollback_id": null,
   "sql": "SELECT * FROM users WHERE age > 25",
+  "generated_sql": "SELECT * FROM users WHERE age > 25",
+  "verification_queries": ["SELECT COUNT(*) AS c FROM users WHERE age > 25"],
   "execution": {
     "success": true,
     "rowcount": 42,
+    "lastrowid": null,
+    "rows": [],
     "error": null
   },
   "stages": [
     {
-      "stage": "semantic",
+      "stage": "generation",
       "passed": true,
-      "reason": "Intent and SQL are semantically aligned",
-      "details": {"action": "SELECT"}
+      "reason": "AI generated SQL from the English explanation.",
+      "details": {"attempt": 1, "sql": "SELECT * FROM users WHERE age > 25"}
     },
     {
-      "stage": "safety",
+      "stage": "sql_verification",
       "passed": true,
-      "reason": "SQL passed rule-based safety checks",
-      "details": {"command": "SELECT"}
+      "reason": "SQL verification passed.",
+      "details": {"attempt": 1}
     },
     {
-      "stage": "execution",
+      "stage": "verification",
       "passed": true,
-      "reason": "SQL executed successfully",
-      "details": {"rowcount": 42, "attempt": 1}
+      "reason": "Verification passed.",
+      "details": {"attempt": 1}
     }
   ],
   "attempts": 1
 }
 ```
 
+When a mutating sqlite statement is committed, the response can include a non-null `rollback_id`.
+
+### Rollback Snapshots
+
+```bash
+GET /rollback/snapshots
+```
+
+Lists stored rollback snapshots for the running backend process.
+
+### Apply Rollback
+
+```bash
+POST /rollback/{rollback_id}
+```
+
+Restores the sqlite database file from the snapshot identified by `rollback_id`.
+Rollback checkpoints are supported for:
+- sqlite file databases (copy/restore the DB file)
+- PostgreSQL (logical dump via `pg_dump`, restore via `psql`)
+- MySQL (logical dump via `mysqldump`, restore via `mysql`)
+
+Notes:
+- sqlite `:memory:` targets cannot be snapshotted.
+- PostgreSQL/MySQL checkpointing requires the corresponding client tools to be installed in the backend runtime.
+
 ## Configuration
 
 ### Environment Variables
 
 ```bash
-# Server configuration
-PLAINDB_HOST=0.0.0.0           # Server host
-PLAINDB_PORT=8000               # Server port
-PLAINDB_DB_PATH=plaindb.sqlite  # Database file path
-
-# API configuration
-PLAINDB_LOG_LEVEL=INFO          # Logging level
+# Default request settings
+PLAINDB_DEFAULT_DATABASE=:memory:
+PLAINDB_DEFAULT_AI_PROVIDER=gemini
+PLAINDB_DEFAULT_MODEL=gemini-2.5-flash
 ```
 
 ### Using Python Package
@@ -211,46 +287,33 @@ PLAINDB_LOG_LEVEL=INFO          # Logging level
 The backend can also be imported and used directly in Python:
 
 ```python
-from plain_db import PlainDBPipeline, PipelineConfig, SQLCandidate, UserIntent
-from plain_db.adapters import SQLiteAdapter
+from plain_db import BackendRequest, DatabaseTarget, PlainDBArchitecturePipeline
 
-# Initialize adapter
-adapter = SQLiteAdapter("path/to/database.db")
-
-# Create pipeline
-pipeline = PlainDBPipeline(adapter)
-
-# Create intent and SQL candidate
-intent = UserIntent(
-    text="Get users older than 25",
-    expected_tables=["users"],
-    expected_action="SELECT"
+pipeline = PlainDBArchitecturePipeline()
+result = pipeline.run(
+  BackendRequest(
+    english_explanation="Show all users older than 25",
+    ai_provider="gemini",
+    api_key="YOUR_AI_KEY",
+    ai_model="gemini-2.5-flash",
+    database=DatabaseTarget(dialect="sqlite", database=":memory:"),
+    dry_run=True,
+  )
 )
 
-candidate = SQLCandidate(
-    sql="SELECT * FROM users WHERE age > 25",
-    model_name="gemini-2.5-flash"
-)
-
-# Run pipeline
-result = pipeline.run(intent, candidate)
-
-# Check results
-if result.accepted:
-    print(f"SQL accepted and committed in {result.attempts} attempt(s)")
-    if result.execution:
-        print(f"Rows affected: {result.execution.rowcount}")
+print(result.generated_sql)
 ```
 
 ## Verification Pipeline
 
 The pipeline performs the following verification stages:
 
-1. **Semantic Verification** - Ensures SQL matches user intent (action type, tables)
-2. **Safety Verification** - Blocks forbidden operations (DROP, TRUNCATE, etc.)
-3. **Execution** - Runs SQL in a transaction
-4. **Effect Verification** - Validates that changes match intent
-5. **Post-Commit Verification** - Confirms final state is correct
+1. **Schema introspection** - Reads table, column, foreign key, and row-count metadata.
+2. **SQL generation** - Uses AI to produce SQL from the English explanation.
+3. **SQL verification** - Uses AI to check whether the SQL matches the request.
+4. **Verification query planning** - Uses schema context to generate SELECT checks.
+5. **Transactional execution** - Runs SQL in a transaction and rolls back on failure.
+6. **Result verification** - Re-checks the database state and retries only when the SQL itself was wrong.
 
 All stages are logged in the response for audit and debugging.
 
@@ -264,18 +327,26 @@ backend/
 │   ├── __init__.py
 │   ├── models.py               # Domain models
 │   ├── interfaces.py           # Abstract interfaces
-│   ├── pipeline.py             # Verification pipeline
+│   ├── architecture.py         # Main architecture pipeline
+│   ├── llm.py                  # AI provider client
+│   ├── schema.py               # Schema model types
+│   ├── pipeline.py             # Legacy verification pipeline
 │   ├── safety.py               # Safety verifiers
 │   ├── default_verifiers.py    # Default implementations
 │   └── adapters/
 │       ├── __init__.py
-│       └── sqlite_adapter.py   # SQLite implementation
+│       ├── factory.py          # Dialect-based adapter selector
+│       ├── dbapi_adapter.py    # Shared DB-API adapter base
+│       ├── sqlite_adapter.py
+│       ├── postgresql_adapter.py
+│       └── mysql_adapter.py
 ├── api/                        # REST API
 │   ├── __init__.py
 │   └── main.py                 # FastAPI app
 ├── tests/                      # Test suite
 │   ├── test_pipeline.py
-│   └── test_api.py
+│   ├── test_api.py
+│   └── test_adapter_factory.py
 ├── setup.py                    # Package configuration
 ├── requirements.txt            # Dependencies
 ├── Dockerfile                  # Production image
@@ -330,11 +401,12 @@ class PostgreSQLAdapter(DatabaseAdapter):
 
 The DBeaver plugin communicates with this backend via the REST API:
 
-1. User selects "PlainDB (Backend)" as provider in DBeaver
-2. Configures backend URL (e.g., `http://localhost:8000`)
-3. Plugin sends SQL generation requests to `/api/v1/generate-sql`
-4. Backend processes request and returns verification results
-5. Plugin displays results to user
+1. User configures backend URL (e.g., `http://localhost:8000`) in DBeaver.
+2. Plugin sends execution requests to `/run`.
+3. Backend performs generation, verification, execution, and commit/rollback decisions.
+4. For sqlite file snapshots, backend may return `rollback_id`.
+5. Plugin can apply rollback through `POST /rollback/{rollback_id}`.
+6. Plugin displays backend results and audit information to user.
 
 See [../dbeaver-plugin/README.md](../dbeaver-plugin/README.md) for integration details.
 
@@ -353,11 +425,11 @@ PLAINDB_PORT=8001 python -m uvicorn api.main:app
 ### Database connection errors
 
 ```bash
-# Check database file permissions
+# SQLite: check database file permissions
 ls -la /path/to/database.db
 
-# Use absolute path
-export PLAINDB_DB_PATH=/absolute/path/to/db.sqlite
+# PostgreSQL/MySQL: verify host, port, credentials, and DB name
+# You can also pass a full connection_string in database_target
 ```
 
 ### Tests failing
@@ -384,11 +456,3 @@ pytest tests/test_pipeline.py::TestSemanticVerifier::test_select_intent_matches_
 - **Only DML commands** (SELECT, INSERT, UPDATE, DELETE) allowed by default
 - **Transaction boundaries** ensure rollback on errors
 - Extend `SafetyVerifier` for additional security policies
-
-## License
-
-MIT - See [LICENSE](../../LICENSE) for details
-
-## Contributing
-
-See [../CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines
